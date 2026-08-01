@@ -1,59 +1,122 @@
-# OBS Plugin Template
+# Sponsor Integration
 
-## Introduction
+An OBS Studio plugin with tooling for running sponsor and advertising content on stream.
 
-The plugin template is meant to be used as a starting point for OBS Studio plugin development. It includes:
+Currently it provides a single source type: **Ad Playlist**.
 
-* Boilerplate plugin source code
-* A CMake project file
-* GitHub Actions workflows and repository actions
+## Ad Playlist
 
-## Supported Build Environments
+A playlist source in the spirit of Image Slide Show or VLC Video Source, except it cycles through
+**videos and images in the same list** and transitions between them.
 
-| Platform  | Tool   |
+* Videos always play their full roll; images hold for a configurable amount of time.
+* A configurable transition runs between items, driven either by the end of a video or by the image
+  hold timer.
+* Looping, shuffling, manual next/previous, and OBS media controls.
+
+### Playlist
+
+Add files with the **Playlist** list. Anything OBS can decode works — `.mp4`, `.mov`, `.mkv`,
+`.webm`, `.ts`, `.avi`, `.flv`, audio-only files, and images (`.png`, `.jpg`, `.gif`, `.webp`, …).
+Adding a directory pulls in every supported file inside it, sorted by name so the running order is
+the same on every machine and every launch.
+
+Items are recognised by extension: known image extensions are loaded as image sources, everything
+else is loaded as a media source.
+
+### Playback
+
+| Setting | Description |
+|---|---|
+| **Image hold time** | How long a still image stays on screen. Videos ignore this and play to their end. |
+| **Loop playlist** | Start over after the last item. With looping off the playlist stops on the last item. |
+| **Shuffle order** | Shuffles the running order rather than picking at random, so every spot plays exactly once per pass. The order is reshuffled each pass, never repeating an item across the loop point. |
+| **Hide when the playlist ends** | With looping off, transition out to nothing at the end instead of holding the last frame. |
+| **Restart playlist when the source becomes visible** | Start from the first item every time the source is shown. With this off, showing the source resumes at the item it was on. |
+| **Volume** | Attenuates the audio of the whole playlist. |
+| **Keep media files loaded** | Keeps each video open and its first frame decoded so items start instantly. Turn it off for very large playlists to save memory, at the cost of a short load when each item comes up. |
+| **Use hardware decoding** | Passed through to the underlying media sources. |
+
+The playlist only advances while the source is visible. A hidden Ad Playlist holds its position
+instead of burning through the rotation off screen.
+
+### Transition
+
+Choose between **Cut**, **Fade**, **Swipe**, **Slide**, **Fade to Color** and **Stinger**. The
+options for the selected transition (direction, color, stinger video and transition point, …) appear
+underneath it.
+
+**Transition timing** decides when the transition fires:
+
+* **Overlap the end of the item** *(default)* — the transition starts early enough to land exactly
+  on the item's last frame, so a video's tail plays underneath the transition and an image is on
+  screen for exactly its hold time. For a stinger, "early enough" means the stinger's transition
+  point, so the incoming item is swapped in behind the stinger at the right moment.
+* **Start after the item finishes** — the item plays out first and the transition runs afterwards.
+  Each cycle then takes the item's duration *plus* the transition.
+
+### Appearance
+
+**Bounding size / aspect ratio** is either `Automatic` (the source grows to fit the largest item in
+the playlist), a fixed resolution such as `1920x1080`, or an aspect ratio such as `16:9`. Items are
+placed inside those bounds using the **Scale mode** and **Alignment** settings.
+
+Automatic sizing never shrinks during a session, because a video only reports its dimensions once it
+has been opened, and a scene item that resizes itself mid-rotation is worse than one that is
+slightly too large. For playlists mixing several resolutions, set a fixed bounding size.
+
+### Controls
+
+The source is a controllable media source, so it appears in the **Media Controls** dock with
+play/pause, restart, stop, next and previous, and the timeline shows the progress of the current
+item. The same five actions are available as assignable hotkeys.
+
+### Automation
+
+The source exposes procedures and signals for scripts and `obs-websocket`:
+
+| | |
+|---|---|
+| proc `current_index(out int current_index)` | Index of the current item in the playlist, or `-1`. |
+| proc `current_path(out string current_path)` | File path of the current item. |
+| proc `total_items(out int total_items)` | Number of items in the playlist. |
+| signal `ad_item_changed(int index, int position, string path, bool is_video)` | An item started. `index` is its place in the playlist, `position` its place in the (possibly shuffled) running order. |
+| signal `ad_playlist_ended()` | A non-looping playlist reached its end. |
+
+## Building
+
+This project uses the OBS plugin template build system.
+
+| Platform | Tool |
 |-----------|--------|
-| Windows   | Visual Studio 17 2022 |
-| macOS     | XCode 16.0 |
-| Windows, macOS  | CMake 3.30.5 |
-| Ubuntu 24.04 | CMake 3.28.3 |
-| Ubuntu 24.04 | `ninja-build` |
-| Ubuntu 24.04 | `pkg-config`
-| Ubuntu 24.04 | `build-essential` |
+| Windows | Visual Studio 17 2022 |
+| macOS | Xcode 16.0 |
+| Windows, macOS | CMake 3.30.5 |
+| Ubuntu 24.04 | CMake 3.28.3, `ninja-build`, `pkg-config`, `build-essential` |
 
-## Quick Start
+```sh
+cmake --preset ubuntu-x86_64   # or macos / windows-x64
+cmake --build build_x86_64
+```
 
-An absolute bare-bones [Quick Start Guide](https://github.com/obsproject/obs-plugintemplate/wiki/Quick-Start-Guide) is available in the wiki.
+Build documentation for the underlying template lives in the
+[Plugin Template Wiki](https://github.com/obsproject/obs-plugintemplate/wiki):
+[Getting started](https://github.com/obsproject/obs-plugintemplate/wiki/Getting-Started),
+[Build system requirements](https://github.com/obsproject/obs-plugintemplate/wiki/Build-System-Requirements),
+[Build system options](https://github.com/obsproject/obs-plugintemplate/wiki/CMake-Build-System-Options).
 
-## Documentation
+### GitHub Actions & CI
 
-All documentation can be found in the [Plugin Template Wiki](https://github.com/obsproject/obs-plugintemplate/wiki).
+Default workflows are provided for the following repository actions:
 
-Suggested reading to get up and running:
+* `push`: commits or tags pushed to `master` or `main`.
+* `pr-pull`: a pull request has been pushed or synchronized.
+* `dispatch`: triggered from GitHub's workflow dispatch UI.
+* `build-project`: builds the project, triggered by the other workflows.
+* `check-format`: checks CMake and source formatting, triggered by the other workflows.
 
-* [Getting started](https://github.com/obsproject/obs-plugintemplate/wiki/Getting-Started)
-* [Build system requirements](https://github.com/obsproject/obs-plugintemplate/wiki/Build-System-Requirements)
-* [Build system options](https://github.com/obsproject/obs-plugintemplate/wiki/CMake-Build-System-Options)
+Successful builds produce downloadable artifacts. To create a release, push a semver tag (e.g.
+`1.2.3`) to the default branch; a draft release is created with installer packages attached.
 
-## GitHub Actions & CI
-
-Default GitHub Actions workflows are available for the following repository actions:
-
-* `push`: Run for commits or tags pushed to `master` or `main` branches.
-* `pr-pull`: Run when a Pull Request has been pushed or synchronized.
-* `dispatch`: Run when triggered by the workflow dispatch in GitHub's user interface.
-* `build-project`: Builds the actual project and is triggered by other workflows.
-* `check-format`: Checks CMake and plugin source code formatting and is triggered by other workflows.
-
-The workflows make use of GitHub repository actions (contained in `.github/actions`) and build scripts (contained in `.github/scripts`) which are not needed for local development, but might need to be adjusted if additional/different steps are required to build the plugin.
-
-### Retrieving build artifacts
-
-Successful builds on GitHub Actions will produce build artifacts that can be downloaded for testing. These artifacts are commonly simple archives and will not contain package installers or installation programs.
-
-### Building a Release
-
-To create a release, an appropriately named tag needs to be pushed to the `main`/`master` branch using semantic versioning (e.g., `12.3.4`, `23.4.5-beta2`). A draft release will be created on the associated repository with generated installer packages or installation programs attached as release artifacts.
-
-## Signing and Notarizing on macOS
-
-Basic concepts of codesigning and notarization on macOS are explained in the correspodning [Wiki article](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS) which has a specific section for the [GitHub Actions setup](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS#setting-up-code-signing-for-github-actions).
+Codesigning and notarization on macOS are covered in the template's
+[Codesigning wiki article](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS).
