@@ -30,6 +30,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 	blog(level, "[ad playlist: '%s'] " format, obs_source_get_name(ap->source), ##__VA_ARGS__)
 
 #define warn(format, ...) do_log(LOG_WARNING, format, ##__VA_ARGS__)
+#define info(format, ...) do_log(LOG_INFO, format, ##__VA_ARGS__)
 
 /* clang-format off */
 
@@ -159,7 +160,23 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * one frame, so the transition still has a picture to work with. */
 #define END_GUARD_MS 50
 
+/* How often the state of the audio chain is reported, in seconds. */
+#define AUDIO_DIAG_INTERVAL 1.0f
+
 /* ------------------------------------------------------------------------- */
+
+/*
+ * How far the audio handed over by the transition got on the last mix. Audio is
+ * pulled on the audio thread, where a silent playlist otherwise leaves no trace
+ * anywhere it can be seen, so the stage is recorded there and reported from the
+ * video tick whenever it changes.
+ */
+enum ap_audio_stage {
+	AP_AUDIO_OK,
+	AP_AUDIO_NO_TRANSITION,
+	AP_AUDIO_TR_PENDING,
+	AP_AUDIO_TR_NO_TS,
+};
 
 struct ad_item {
 	char *path;
@@ -225,6 +242,11 @@ struct ad_playlist {
 	enum obs_transition_scale_type scale_type;
 	uint32_t alignment;
 	float size_timer;
+
+	/* ---- audio ---- */
+	volatile long audio_stage; /* enum ap_audio_stage, written on the audio thread */
+	long audio_stage_logged;
+	float audio_diag_timer;
 
 	calldata_t cd;
 
@@ -1263,6 +1285,7 @@ static void *ap_create(obs_data_t *settings, obs_source_t *source)
 	ap->alignment = OBS_ALIGN_CENTER;
 	ap->auto_size = true;
 	ap->volume = 1.0f;
+	ap->audio_stage_logged = -1; /* nothing reported yet - the first report always lands */
 
 	da_init(ap->items);
 	da_init(ap->order);
@@ -1377,6 +1400,58 @@ static bool item_reached_end(struct ad_playlist *ap, struct ad_item *item, bool 
 	return time >= duration - (int64_t)lead_ms;
 }
 
+static const char *audio_stage_name(long stage)
+{
+	switch ((enum ap_audio_stage)stage) {
+	case AP_AUDIO_OK:
+		return "mixing";
+	case AP_AUDIO_NO_TRANSITION:
+		return "no transition to pull from";
+	case AP_AUDIO_TR_PENDING:
+		return "transition handed over no audio";
+	case AP_AUDIO_TR_NO_TS:
+		return "transition audio has no timestamp";
+	}
+
+	return "unknown";
+}
+
+/*
+ * Report where the audio chain got, and what the item itself is handing to the
+ * transition, whenever either changes. Between them the two tell apart a media
+ * file that is producing no audio at all, a transition that is not passing it
+ * on, and a playlist that is mixing audio that goes silent further downstream.
+ *
+ * Mutex must be held.
+ */
+static void report_audio_state(struct ad_playlist *ap, struct ad_item *item, float seconds)
+{
+	long stage;
+
+	ap->audio_diag_timer += seconds;
+	if (ap->audio_diag_timer < AUDIO_DIAG_INTERVAL)
+		return;
+
+	ap->audio_diag_timer = 0.0f;
+
+	/* only meaningful once the item is actually rolling */
+	if (!item->is_video || !ap->started)
+		return;
+
+	stage = os_atomic_load_long(&ap->audio_stage);
+	if (stage == ap->audio_stage_logged)
+		return;
+
+	ap->audio_stage_logged = stage;
+
+	if (stage == AP_AUDIO_OK)
+		info("audio: mixing '%s' at %d%%", item->path, (int)(ap->volume * 100.0f + 0.5f));
+	else
+		warn("audio: %s for '%s' (item audio %s, timestamp %llu)", audio_stage_name(stage), item->path,
+		     obs_source_audio_pending(item->source) ? "pending" : "ready",
+		     (unsigned long long)obs_source_get_audio_timestamp(item->source));
+}
+
 static void ap_video_tick(void *data, float seconds)
 {
 	struct ad_playlist *ap = data;
@@ -1424,6 +1499,8 @@ static void ap_video_tick(void *data, float seconds)
 
 	ap->elapsed += seconds;
 
+	report_audio_state(ap, item, seconds);
+
 	last_item = !ap->loop && ap->order_pos + 1 >= ap->order.num;
 
 	if (item_reached_end(ap, item, last_item && !ap->hide_when_done))
@@ -1433,19 +1510,19 @@ finish:
 	pthread_mutex_unlock(&ap->mutex);
 }
 
-static inline bool render_child_audio(obs_source_t *transition, uint64_t *ts_out,
-				      struct obs_source_audio_mix *audio_output, uint32_t mixers, size_t channels,
-				      float volume)
+static inline enum ap_audio_stage render_child_audio(obs_source_t *transition, uint64_t *ts_out,
+						     struct obs_source_audio_mix *audio_output, uint32_t mixers,
+						     size_t channels, float volume)
 {
 	struct obs_source_audio_mix child_audio;
 	uint64_t source_ts;
 
 	if (obs_source_audio_pending(transition))
-		return false;
+		return AP_AUDIO_TR_PENDING;
 
 	source_ts = obs_source_get_audio_timestamp(transition);
 	if (!source_ts)
-		return false;
+		return AP_AUDIO_TR_NO_TS;
 
 	obs_source_get_audio_mix(transition, &child_audio);
 
@@ -1467,7 +1544,7 @@ static inline bool render_child_audio(obs_source_t *transition, uint64_t *ts_out
 	}
 
 	*ts_out = source_ts;
-	return true;
+	return AP_AUDIO_OK;
 }
 
 static bool ap_audio_render(void *data, uint64_t *ts_out, struct obs_source_audio_mix *audio_output, uint32_t mixers,
@@ -1475,16 +1552,20 @@ static bool ap_audio_render(void *data, uint64_t *ts_out, struct obs_source_audi
 {
 	struct ad_playlist *ap = data;
 	obs_source_t *transition = get_transition(ap);
-	bool success;
+	enum ap_audio_stage stage;
 
-	if (!transition)
+	if (!transition) {
+		os_atomic_set_long(&ap->audio_stage, AP_AUDIO_NO_TRANSITION);
 		return false;
+	}
 
-	success = render_child_audio(transition, ts_out, audio_output, mixers, channels, ap->volume);
+	stage = render_child_audio(transition, ts_out, audio_output, mixers, channels, ap->volume);
 	obs_source_release(transition);
 
+	os_atomic_set_long(&ap->audio_stage, (long)stage);
+
 	UNUSED_PARAMETER(sample_rate);
-	return success;
+	return stage == AP_AUDIO_OK;
 }
 
 static void ap_enum_sources(void *data, obs_source_enum_proc_t cb, void *param)
