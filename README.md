@@ -19,7 +19,9 @@ A playlist source in the spirit of Image Slide Show or VLC Video Source, except 
 Add files with the **Playlist** list. Anything OBS can decode works — `.mp4`, `.mov`, `.mkv`,
 `.webm`, `.ts`, `.avi`, `.flv`, audio-only files, and images (`.png`, `.jpg`, `.gif`, `.webp`, …).
 Adding a directory pulls in every supported file inside it, sorted by name so the running order is
-the same on every machine and every launch.
+the same on every machine and every launch. A directory is read when the playlist is edited and when
+the source is loaded, not on every settings change, so files dropped into it while OBS is running
+are picked up the next time the list is touched.
 
 Items are recognised by extension: known image extensions are loaded as image sources, everything
 else is loaded as a media source.
@@ -33,7 +35,7 @@ else is loaded as a media source.
 | **Shuffle order** | Shuffles the running order rather than picking at random, so every spot plays exactly once per pass. The order is reshuffled each pass, never repeating an item across the loop point. |
 | **Hide when the playlist ends** | With looping off, transition out to nothing at the end instead of holding the last frame. |
 | **Restart playlist when the source becomes visible** | Start from the first item every time the source is shown. With this off, showing the source resumes at the item it was on. |
-| **Volume** | Attenuates the audio of the whole playlist. |
+| **Volume** | Attenuates the audio of the whole playlist. Takes effect immediately without interrupting the item on screen. |
 | **Keep media files loaded** | Keeps each video open and its first frame decoded so items start instantly. Turn it off for very large playlists to save memory, at the cost of a short load when each item comes up. |
 | **Use hardware decoding** | Passed through to the underlying media sources. |
 

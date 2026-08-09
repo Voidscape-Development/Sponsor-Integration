@@ -186,6 +186,7 @@ struct ad_item {
 
 typedef DARRAY(struct ad_item) ad_item_array_t;
 typedef DARRAY(size_t) index_array_t;
+typedef DARRAY(char *) path_array_t;
 
 struct ad_playlist {
 	obs_source_t *source;
@@ -210,6 +211,19 @@ struct ad_playlist {
 	bool use_stinger;
 	char *tr_type;     /* transition setting value */
 	const char *tr_id; /* libobs transition source id */
+
+	/*
+	 * What the children were last built from. OBS calls update() for every
+	 * change to any property - including every step of a slider drag - and
+	 * rebuilding the playlist or reopening the transition for a setting that
+	 * neither depends on is both ruinously expensive and disruptive to
+	 * whatever is on screen. These say whether the inputs actually moved.
+	 *
+	 * `configured_paths` is the file list as it is configured, before
+	 * directories are expanded.
+	 */
+	path_array_t configured_paths;
+	char *tr_settings_sig;
 
 	/* ---- children ---- */
 	obs_source_t *transition;
@@ -859,6 +873,76 @@ static void parse_bounding_size(struct ad_playlist *ap, const char *val)
 	ap->bound_cy = (uint32_t)cy;
 }
 
+static void free_paths(path_array_t *paths)
+{
+	for (size_t i = 0; i < paths->num; i++)
+		bfree(paths->array[i]);
+
+	da_free(*paths);
+}
+
+/* The playlist as it is configured, with the blank entries dropped and the
+ * directories still unexpanded. */
+static void read_configured_paths(obs_data_t *settings, path_array_t *paths)
+{
+	obs_data_array_t *array = obs_data_get_array(settings, S_FILES);
+	size_t count = obs_data_array_count(array);
+
+	for (size_t i = 0; i < count; i++) {
+		obs_data_t *item = obs_data_array_item(array, i);
+		const char *path = obs_data_get_string(item, "value");
+
+		if (path && *path) {
+			char *copy = bstrdup(path);
+			da_push_back(*paths, &copy);
+		}
+
+		obs_data_release(item);
+	}
+
+	obs_data_array_release(array);
+}
+
+static bool paths_equal(const path_array_t *a, const path_array_t *b)
+{
+	if (a->num != b->num)
+		return false;
+
+	for (size_t i = 0; i < a->num; i++) {
+		if (strcmp(a->array[i], b->array[i]) != 0)
+			return false;
+	}
+
+	return true;
+}
+
+static char *transition_signature(obs_data_t *tr_settings)
+{
+	const char *json = obs_data_get_json(tr_settings);
+	return bstrdup(json ? json : "");
+}
+
+/* Takes ownership of `fresh`. */
+static bool signature_changed(char **stored, char *fresh)
+{
+	if (*stored && strcmp(*stored, fresh) == 0) {
+		bfree(fresh);
+		return false;
+	}
+
+	bfree(*stored);
+	*stored = fresh;
+
+	return true;
+}
+
+/*
+ * OBS calls this for every change to any property, and a slider hands over a
+ * new value for every step of the drag. Rebuilding the playlist reopens every
+ * media file and restarts playback from the top, so it only runs when the
+ * settings behind the children actually changed - a volume drag just stores a
+ * float and leaves the rotation alone.
+ */
 static void ap_update(void *data, obs_data_t *settings)
 {
 	struct ad_playlist *ap = data;
@@ -867,25 +951,37 @@ static void ap_update(void *data, obs_data_t *settings)
 	obs_source_t *new_tr = NULL;
 	obs_source_t *old_tr = NULL;
 	obs_data_t *tr_settings;
-	obs_data_array_t *array;
+	path_array_t paths;
 	const char *tr_type;
 	const char *scale_mode;
 	bool is_cut;
 	bool is_stinger;
-	size_t count;
+	bool shuffle;
+	bool preload;
+	bool hw_decode;
+	bool reload_items;
+	bool reload_order;
+	bool tr_settings_moved;
+	bool first_update = !ap->tr_type;
 
 	da_init(new_items);
+	da_init(old_items);
+	da_init(paths);
 
 	/* ------------------------------------- */
 	/* plain settings                        */
 
+	shuffle = obs_data_get_bool(settings, S_SHUFFLE);
+	preload = obs_data_get_bool(settings, S_PRELOAD);
+	hw_decode = obs_data_get_bool(settings, S_HW_DECODE);
+
+	reload_order = shuffle != ap->shuffle;
+
 	ap->overlap = astrcmpi(obs_data_get_string(settings, S_TR_TIMING), TIMING_AFTER) != 0;
 	ap->loop = obs_data_get_bool(settings, S_LOOP);
-	ap->shuffle = obs_data_get_bool(settings, S_SHUFFLE);
+	ap->shuffle = shuffle;
 	ap->hide_when_done = obs_data_get_bool(settings, S_HIDE_DONE);
 	ap->restart_on_show = obs_data_get_bool(settings, S_RESTART_ON_SHOW);
-	ap->preload = obs_data_get_bool(settings, S_PRELOAD);
-	ap->hw_decode = obs_data_get_bool(settings, S_HW_DECODE);
 	ap->image_time = (float)obs_data_get_int(settings, S_IMAGE_TIME) / 1000.0f;
 	ap->tr_duration_ms = (uint32_t)obs_data_get_int(settings, S_TR_DURATION);
 	ap->stinger_point_ms = (uint32_t)obs_data_get_int(settings, S_TR_STINGER_POINT);
@@ -908,20 +1004,32 @@ static void ap_update(void *data, obs_data_t *settings)
 	/* ------------------------------------- */
 	/* playlist contents                     */
 
-	array = obs_data_get_array(settings, S_FILES);
-	count = obs_data_array_count(array);
+	/*
+	 * The child sources are built from the file list and from the two
+	 * options baked into each media source. Anything else - the volume in
+	 * particular - leaves them alone: expanding the directories walks the
+	 * filesystem, and handing a media source new settings makes it reopen
+	 * its file, neither of which survives being done once per slider step.
+	 */
+	read_configured_paths(settings, &paths);
 
-	for (size_t i = 0; i < count; i++) {
-		obs_data_t *item = obs_data_array_item(array, i);
-		const char *path = obs_data_get_string(item, "value");
+	reload_items = first_update || preload != ap->preload || hw_decode != ap->hw_decode ||
+		       !paths_equal(&paths, &ap->configured_paths);
 
-		if (path && *path && !add_directory(ap, &new_items, path))
-			add_item(ap, &new_items, path);
+	ap->preload = preload;
+	ap->hw_decode = hw_decode;
 
-		obs_data_release(item);
+	if (reload_items) {
+		for (size_t i = 0; i < paths.num; i++) {
+			if (!add_directory(ap, &new_items, paths.array[i]))
+				add_item(ap, &new_items, paths.array[i]);
+		}
+
+		free_paths(&ap->configured_paths);
+		ap->configured_paths = paths;
+	} else {
+		free_paths(&paths);
 	}
-
-	obs_data_array_release(array);
 
 	/* ------------------------------------- */
 	/* appearance                            */
@@ -943,22 +1051,26 @@ static void ap_update(void *data, obs_data_t *settings)
 
 	pthread_mutex_lock(&ap->mutex);
 
-	queue_stop_of_current(ap);
-	stop_pending_media(ap, true);
+	if (reload_items) {
+		queue_stop_of_current(ap);
+		stop_pending_media(ap, true);
 
-	old_items = ap->items;
-	ap->items = new_items;
+		old_items = ap->items;
+		ap->items = new_items;
+	}
 
 	if (new_tr) {
 		old_tr = ap->transition;
 		ap->transition = new_tr;
 	}
 
-	build_order(ap);
-	ap->order_pos = 0;
-	ap->elapsed = 0.0f;
-	ap->started = false;
-	ap->finished = false;
+	if (reload_items || reload_order) {
+		build_order(ap);
+		ap->order_pos = 0;
+		ap->elapsed = 0.0f;
+		ap->started = false;
+		ap->finished = false;
+	}
 
 	pthread_mutex_unlock(&ap->mutex);
 
@@ -978,7 +1090,13 @@ static void ap_update(void *data, obs_data_t *settings)
 	}
 
 	tr_settings = build_transition_settings(ap, settings);
-	obs_source_update(ap->transition, tr_settings);
+	tr_settings_moved = signature_changed(&ap->tr_settings_sig, transition_signature(tr_settings));
+
+	/* a stinger reopens its video every time it is updated, so only hand the
+	 * settings over when they moved - or when the transition is brand new */
+	if (tr_settings_moved || new_tr)
+		obs_source_update(ap->transition, tr_settings);
+
 	obs_data_release(tr_settings);
 
 	obs_transition_set_alignment(ap->transition, ap->alignment);
@@ -989,21 +1107,28 @@ static void ap_update(void *data, obs_data_t *settings)
 
 	pthread_mutex_lock(&ap->mutex);
 
-	ap->cx = 0;
-	ap->cy = 0;
-	ap->content_cx = 0;
-	ap->content_cy = 0;
+	if (reload_items) {
+		ap->cx = 0;
+		ap->cy = 0;
+		ap->content_cx = 0;
+		ap->content_cy = 0;
+	}
+
 	update_size(ap);
 
-	if (ap->items.num) {
-		ap->stopped = false;
-		ap->paused = false;
-		set_media_state(ap, OBS_MEDIA_STATE_PLAYING);
-		do_transition(ap, false);
-		obs_source_media_started(ap->source);
-	} else {
-		set_media_state(ap, OBS_MEDIA_STATE_NONE);
-		do_transition(ap, true);
+	/* A transition that was just created is showing nothing, so the current
+	 * item has to be handed to it even when the playlist itself stood still. */
+	if (reload_items || reload_order || new_tr) {
+		if (ap->items.num) {
+			ap->stopped = false;
+			ap->paused = false;
+			set_media_state(ap, OBS_MEDIA_STATE_PLAYING);
+			do_transition(ap, false);
+			obs_source_media_started(ap->source);
+		} else {
+			set_media_state(ap, OBS_MEDIA_STATE_NONE);
+			do_transition(ap, true);
+		}
 	}
 
 	pthread_mutex_unlock(&ap->mutex);
@@ -1268,6 +1393,8 @@ static void ap_destroy(void *data)
 	free_items(&ap->items);
 	da_free(ap->order);
 	bfree(ap->tr_type);
+	bfree(ap->tr_settings_sig);
+	free_paths(&ap->configured_paths);
 	calldata_free(&ap->cd);
 	pthread_mutex_destroy(&ap->mutex);
 	bfree(ap);
