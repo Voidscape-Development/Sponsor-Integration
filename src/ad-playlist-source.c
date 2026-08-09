@@ -262,8 +262,6 @@ struct ad_playlist {
 	long audio_stage_logged;
 	float audio_diag_timer;
 
-	calldata_t cd;
-
 	obs_hotkey_id play_pause_hotkey;
 	obs_hotkey_id restart_hotkey;
 	obs_hotkey_id stop_hotkey;
@@ -588,16 +586,32 @@ static void queue_stop_of_current(struct ad_playlist *ap)
 		ap->stop_pending = obs_source_get_ref(item->source);
 }
 
+/*
+ * The calldata is a local, never a member: this signal is emitted with the
+ * mutex held, and a handler that turns around and moves the playlist - a script
+ * calling next() on the item it was just told about, say - re-enters and emits
+ * again from underneath us. A shared buffer would be rewritten (and its string
+ * freed) while the handlers of the outer signal were still reading it.
+ *
+ * Everything the signal carries is read out of the playlist before it is
+ * emitted, for the same reason: `item` belongs to the item array, which a
+ * re-entrant handler is free to rebuild.
+ */
 static void signal_item_changed(struct ad_playlist *ap, struct ad_item *item)
 {
 	signal_handler_t *sh = obs_source_get_signal_handler(ap->source);
+	calldata_t cd;
 
-	calldata_set_int(&ap->cd, "index", (long long)ap->order.array[ap->order_pos]);
-	calldata_set_int(&ap->cd, "position", (long long)ap->order_pos);
-	calldata_set_string(&ap->cd, "path", item->path);
-	calldata_set_bool(&ap->cd, "is_video", item->is_video);
+	calldata_init(&cd);
 
-	signal_handler_signal(sh, "ad_item_changed", &ap->cd);
+	calldata_set_int(&cd, "index", (long long)ap->order.array[ap->order_pos]);
+	calldata_set_int(&cd, "position", (long long)ap->order_pos);
+	calldata_set_string(&cd, "path", item->path);
+	calldata_set_bool(&cd, "is_video", item->is_video);
+
+	signal_handler_signal(sh, "ad_item_changed", &cd);
+
+	calldata_free(&cd);
 }
 
 /* Hand the transition over to the current item, or to nothing at all when
@@ -1395,7 +1409,6 @@ static void ap_destroy(void *data)
 	bfree(ap->tr_type);
 	bfree(ap->tr_settings_sig);
 	free_paths(&ap->configured_paths);
-	calldata_free(&ap->cd);
 	pthread_mutex_destroy(&ap->mutex);
 	bfree(ap);
 }
