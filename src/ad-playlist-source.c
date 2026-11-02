@@ -21,7 +21,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <util/platform.h>
 #include <util/darray.h>
 #include <util/dstr.h>
+#include <util/util_uint64.h>
 
+#include <math.h>
 #include <stdlib.h>
 
 #include "ad-playlist-source.h"
@@ -43,6 +45,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define S_PRELOAD                      "preload"
 #define S_HW_DECODE                    "hw_decode"
 #define S_VOLUME                       "volume"
+#define S_NORMALIZE                    "normalize_loudness"
+#define S_NORM_TARGET                  "normalize_target"
+#define S_NORM_MAX_BOOST               "normalize_max_boost"
 
 #define S_TRANSITION                   "transition"
 #define S_TR_DURATION                  "transition_duration"
@@ -60,6 +65,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define S_ALIGNMENT                    "alignment"
 
 #define S_GROUP_PLAYBACK               "playback_group"
+#define S_GROUP_AUDIO                  "audio_group"
 #define S_GROUP_TRANSITION             "transition_group"
 #define S_GROUP_APPEARANCE             "appearance_group"
 
@@ -88,8 +94,16 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define T_PRELOAD                      T_("Preload")
 #define T_HW_DECODE                    T_("HardwareDecode")
 #define T_VOLUME                       T_("Volume")
+#define T_VOLUME_DESC                  T_("Volume.Desc")
+#define T_NORMALIZE                    T_("Normalize")
+#define T_NORMALIZE_DESC               T_("Normalize.Desc")
+#define T_NORM_TARGET                  T_("Normalize.Target")
+#define T_NORM_TARGET_DESC             T_("Normalize.Target.Desc")
+#define T_NORM_MAX_BOOST               T_("Normalize.MaxBoost")
+#define T_NORM_MAX_BOOST_DESC          T_("Normalize.MaxBoost.Desc")
 
 #define T_GROUP_PLAYBACK               T_("Group.Playback")
+#define T_GROUP_AUDIO                  T_("Group.Audio")
 #define T_GROUP_TRANSITION             T_("Group.Transition")
 #define T_GROUP_APPEARANCE             T_("Group.Appearance")
 
@@ -160,28 +174,173 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * one frame, so the transition still has a picture to work with. */
 #define END_GUARD_MS 50
 
-/* How often the state of the audio chain is reported, in seconds. */
-#define AUDIO_DIAG_INTERVAL 1.0f
+/* ---- audio mixer ---- */
+
+/* How many sources the mixer takes audio from at once: the item being
+ * transitioned away from, the one coming in, and whatever the transition plays
+ * of its own - a stinger has a video of its own and, with a track matte on, a
+ * second one alongside it. */
+#define AP_NUM_DECKS 4
+
+/* How far a source's audio may drift from where it was anchored before it is
+ * anchored again, in nanoseconds. A drift this large is a clock that has been
+ * put back (a restarted file) rather than one that is merely running late. */
+#define AP_DECK_RESYNC_NS UINT64_C(500000000)
+
+/* How long the mixer holds a sample waiting on a source that still has audio
+ * to come, in nanoseconds. Both halves of a transition have to be in before
+ * either can be mixed; the bound keeps one that stops dead from taking the
+ * whole mix down with it. */
+#define AP_MIX_HOLD_NS UINT64_C(60000000)
+
+/* How long a source that has stopped handing audio over is waited on before it
+ * is written off, in nanoseconds. A file with no audio track never hands
+ * anything over at all, and must not hold up the other half of a transition. */
+#define AP_DECK_IDLE_NS UINT64_C(200000000)
+
+/* the most audio the mixer will hold at once, in nanoseconds */
+#define AP_MIX_MAX_NS UINT64_C(1000000000)
+
+/* ---- loudness normalization (ITU-R BS.1770 / EBU R128 style) ---- */
+
+/* Loudness is measured over 400 ms blocks stepped every 100 ms. */
+#define LN_SUB_BLOCKS 4
+
+/* Blocks quieter than this are silence and do not count, in LUFS. */
+#define LN_ABS_GATE (-70.0)
+
+/* Blocks this far below the running measurement are pauses between lines or
+ * a quiet intro, and do not count either, in LU. */
+#define LN_REL_GATE (-10.0)
+
+/* How many blocks have to be measured before the measurement is trusted to
+ * move the level - a little over a second of actual sound. */
+#define LN_MIN_BLOCKS 10
+
+/* How quickly the level follows the measurement, in seconds. Slow enough that
+ * the start of an unmeasured file does not pump, quick enough that it settles
+ * within the first few seconds. A file that has played before starts at its
+ * remembered level straight away. */
+#define LN_SMOOTH_SECONDS 1.0
+
+/* How far a loud file may be turned down, in dB. */
+#define LN_MAX_CUT_DB 30.0
+
+/* Boosting never takes a packet's peak above this. */
+#define LN_PEAK_CEILING 0.95f
+
+/* How many files' loudness is remembered. */
+#define LN_MAX_RECORDS 2048
+
+#define LN_SILENCE (-200.0)
+#define LN_PI 3.14159265358979323846
 
 /* ------------------------------------------------------------------------- */
-
-/*
- * How far the audio handed over by the transition got on the last mix. Audio is
- * pulled on the audio thread, where a silent playlist otherwise leaves no trace
- * anywhere it can be seen, so the stage is recorded there and reported from the
- * video tick whenever it changes.
- */
-enum ap_audio_stage {
-	AP_AUDIO_OK,
-	AP_AUDIO_NO_TRANSITION,
-	AP_AUDIO_TR_PENDING,
-	AP_AUDIO_TR_NO_TS,
-};
 
 struct ad_item {
 	char *path;
 	bool is_video;
 	obs_source_t *source;
+};
+
+/* K-weighting: a high shelf modelling the head, then a high pass. */
+struct ap_kfilter {
+	double b[2][3];
+	double a[2][3];
+};
+
+/* A running loudness measurement of one file. */
+struct ap_loudness {
+	/* filter state, two biquads per channel */
+	double z[MAX_AUDIO_CHANNELS][4];
+	double sub_energy;
+	size_t sub_frames;
+	double ring[LN_SUB_BLOCKS];
+	size_t ring_num;
+	size_t ring_pos;
+	/* the gated blocks so far: their summed mean square and how many */
+	double sum;
+	uint64_t blocks;
+};
+
+/* What is remembered of a file between plays. */
+struct ap_loudness_record {
+	char *path;
+	double sum;
+	uint64_t blocks;
+};
+
+/* One source the mixer is taking audio from. */
+struct ap_deck {
+	/* the source being tapped; the deck holds a reference while it is */
+	obs_source_t *source;
+	/* whether this is something the transition brought along (a stinger's
+	 * own video) rather than a file out of the playlist */
+	bool from_transition;
+	/* the playlist file, for remembering its loudness; NULL otherwise */
+	char *path;
+	/* what the transition scales it by, written by the tick */
+	float gain;
+	/* the gain the last packet ended on, so a change rides across the next
+	 * one rather than stepping and clicking */
+	float applied_gain;
+	/* What has to be added to this source's timestamps to put them on the
+	 * system clock. Every source counts from a base of its own, so the mixer
+	 * works in the system clock and anchors each source to it as its first
+	 * packet arrives. */
+	int64_t offset;
+	bool anchored;
+	/* just past the last sample handed over, on the system clock */
+	uint64_t end_ts;
+	/* when that arrived */
+	uint64_t arrived;
+	/* whether this source is handing audio over at all */
+	bool producing;
+
+	struct ap_loudness meter;
+	/* the normalization being applied right now, in dB */
+	double norm_db;
+};
+
+typedef DARRAY(struct ap_loudness_record) record_array_t;
+
+/* Where the audio of the items being played is added up before it is handed to
+ * OBS. See the audio section further down for what it is for. */
+struct ap_audio {
+	/* Guards everything below. It is a leaf: nothing else is taken under
+	 * it, and it is never taken under ap->mutex. */
+	pthread_mutex_t mutex;
+
+	struct ap_deck deck[AP_NUM_DECKS];
+
+	/* Samples that have been handed over but not let out yet, planar float
+	 * in the mix format; 'ts' is where the first of them sits. */
+	float *buf[MAX_AUDIO_CHANNELS];
+	size_t capacity;
+	size_t frames;
+	uint64_t ts;
+	bool have;
+
+	size_t channels;
+	size_t sample_rate;
+	enum speaker_layout speakers;
+
+	/* just past the last sample let out, so audio that turns up behind it
+	 * is dropped rather than mixed in under what has already gone */
+	uint64_t next_ts;
+	bool flushed;
+
+	struct ap_kfilter kfilter;
+	size_t kfilter_rate;
+
+	/* settings */
+	float volume;
+	bool normalize;
+	double target_lufs;
+	double max_boost_db;
+
+	/* how loud every file played so far measured */
+	record_array_t records;
 };
 
 typedef DARRAY(struct ad_item) ad_item_array_t;
@@ -199,7 +358,6 @@ struct ad_playlist {
 	float image_time;
 	uint32_t tr_duration_ms;
 	uint32_t stinger_point_ms;
-	float volume;
 	bool overlap;
 	bool loop;
 	bool shuffle;
@@ -209,8 +367,10 @@ struct ad_playlist {
 	bool hw_decode;
 	bool use_cut;
 	bool use_stinger;
-	char *tr_type;     /* transition setting value */
-	const char *tr_id; /* libobs transition source id */
+	bool use_to_color;
+	float switch_point; /* fade to color, 0..1 */
+	char *tr_type;      /* transition setting value */
+	const char *tr_id;  /* libobs transition source id */
 
 	/*
 	 * What the children were last built from. OBS calls update() for every
@@ -258,9 +418,12 @@ struct ad_playlist {
 	float size_timer;
 
 	/* ---- audio ---- */
-	volatile long audio_stage; /* enum ap_audio_stage, written on the audio thread */
-	long audio_stage_logged;
-	float audio_diag_timer;
+	/* Whether the transition is between two items, so their audio has to be
+	 * crossed over. Set when one starts and cleared by its transition_stop
+	 * signal, which arrives on the graphics thread. */
+	volatile bool tr_running;
+	/* where the items' audio is mixed on its way out to OBS; guards itself */
+	struct ap_audio audio;
 
 	obs_hotkey_id play_pause_hotkey;
 	obs_hotkey_id restart_hotkey;
@@ -409,6 +572,15 @@ static void add_item(struct ad_playlist *ap, ad_item_array_t *new_items, const c
 		warn("failed to create source for '%s'", path);
 		return;
 	}
+
+	/* The item is played through the playlist's own mixer and nowhere else.
+	 * Leaving it no mixers of its own is what makes that true: libobs mixes
+	 * a source it meets twice in the audio tree straight into the program
+	 * mix, past every parent that would have scaled it, and an item is met
+	 * twice as soon as anything looks at the scene a second time (studio
+	 * mode, extra canvases). With no mixers there is nothing for that path
+	 * to carry. Its audio is tapped as it is decoded instead. */
+	obs_source_set_audio_mixers(source, 0);
 
 	item.path = bstrdup(path);
 	item.is_video = is_video;
@@ -628,6 +800,9 @@ static void do_transition(struct ad_playlist *ap, bool to_null)
 	} else {
 		bool started = obs_transition_start(ap->transition, OBS_TRANSITION_MODE_AUTO, ap->tr_duration_ms,
 						    item ? item->source : NULL);
+
+		if (started)
+			os_atomic_set_bool(&ap->tr_running, true);
 
 		/* libobs rejects a transition to whatever is already on screen,
 		 * which happens with a single item playlist or the same file
@@ -950,6 +1125,24 @@ static bool signature_changed(char **stored, char *fresh)
 	return true;
 }
 
+static void transition_stopped(void *data, calldata_t *cd)
+{
+	struct ad_playlist *ap = data;
+
+	UNUSED_PARAMETER(cd);
+	os_atomic_set_bool(&ap->tr_running, false);
+}
+
+static void connect_transition(struct ad_playlist *ap, obs_source_t *tr, bool connect)
+{
+	signal_handler_t *sh = obs_source_get_signal_handler(tr);
+
+	if (connect)
+		signal_handler_connect(sh, "transition_stop", transition_stopped, ap);
+	else
+		signal_handler_disconnect(sh, "transition_stop", transition_stopped, ap);
+}
+
 /*
  * OBS calls this for every change to any property, and a slider hands over a
  * new value for every step of the drag. Rebuilding the playlist reopens every
@@ -999,19 +1192,31 @@ static void ap_update(void *data, obs_data_t *settings)
 	ap->image_time = (float)obs_data_get_int(settings, S_IMAGE_TIME) / 1000.0f;
 	ap->tr_duration_ms = (uint32_t)obs_data_get_int(settings, S_TR_DURATION);
 	ap->stinger_point_ms = (uint32_t)obs_data_get_int(settings, S_TR_STINGER_POINT);
-	ap->volume = (float)obs_data_get_int(settings, S_VOLUME) / 100.0f;
+	ap->switch_point = (float)obs_data_get_int(settings, S_TR_SWITCH_POINT) / 100.0f;
+
+	pthread_mutex_lock(&ap->audio.mutex);
+	ap->audio.volume = (float)obs_data_get_int(settings, S_VOLUME) / 100.0f;
+	ap->audio.normalize = obs_data_get_bool(settings, S_NORMALIZE);
+	ap->audio.target_lufs = (double)obs_data_get_int(settings, S_NORM_TARGET);
+	ap->audio.max_boost_db = (double)obs_data_get_int(settings, S_NORM_MAX_BOOST);
+	pthread_mutex_unlock(&ap->audio.mutex);
 
 	tr_type = obs_data_get_string(settings, S_TRANSITION);
 	ap->tr_id = transition_id_for(tr_type, &is_cut, &is_stinger);
 	ap->use_cut = is_cut;
 	ap->use_stinger = is_stinger;
+	ap->use_to_color = strcmp(ap->tr_id, "fade_to_color_transition") == 0;
 
 	if (!ap->tr_type || strcmp(ap->tr_type, tr_type) != 0) {
 		new_tr = obs_source_create_private(ap->tr_id, NULL, NULL);
 		bfree(ap->tr_type);
 		ap->tr_type = bstrdup(tr_type);
 
-		if (!new_tr)
+		if (new_tr) {
+			/* the playlist mixes what the transition holds itself */
+			obs_source_set_audio_mixers(new_tr, 0);
+			connect_transition(ap, new_tr, true);
+		} else
 			warn("failed to create transition '%s'", ap->tr_id);
 	}
 
@@ -1089,6 +1294,7 @@ static void ap_update(void *data, obs_data_t *settings)
 	pthread_mutex_unlock(&ap->mutex);
 
 	if (old_tr) {
+		connect_transition(ap, old_tr, false);
 		obs_source_remove_active_child(ap->source, old_tr);
 		obs_source_release(old_tr);
 	}
@@ -1388,6 +1594,922 @@ static void total_items_proc(void *data, calldata_t *cd)
 }
 
 /* ------------------------------------------------------------------------- */
+/* audio
+ *
+ * The playlist hands OBS its own audio rather than leaving the items to be
+ * mixed up the source tree through the transition. That is what puts it in the
+ * audio mixer next to every other source, with a fader, a mute, a meter,
+ * monitoring, audio filters and its own tracks: a composite source may not
+ * carry OBS_SOURCE_AUDIO at all, so while the items were mixed for it the
+ * playlist had none of that and the volume property was the only level it had.
+ *
+ * So the items are taken out of libobs' audio altogether: each is opened with
+ * no audio mixers of its own, and the playlist taps its samples as they are
+ * decoded instead. What is tapped is already in the mix format, because libobs
+ * resamples on the way into obs_source_output_audio(), so the mixer below only
+ * has to line the two items of a transition up in time, scale them the way the
+ * transition would have, and pass the result on through
+ * obs_source_output_audio() on the playlist itself.
+ *
+ * On the way through, every file is measured the way broadcast loudness is
+ * (ITU-R BS.1770: K-weighted, gated, integrated) and brought toward a common
+ * target, so a quiet spot is lifted and a loud one is turned down and the
+ * rotation plays at one even level. The measurement is remembered per file,
+ * so a file that has been through the rotation once starts at its level.    */
+
+static inline uint64_t ap_frames_to_ns(size_t sample_rate, uint64_t frames)
+{
+	return util_mul_div64(frames, UINT64_C(1000000000), sample_rate);
+}
+
+static inline uint64_t ap_ns_to_frames(size_t sample_rate, uint64_t ns)
+{
+	return util_mul_div64(ns, sample_rate, UINT64_C(1000000000));
+}
+
+/* ---- loudness ---- */
+
+/* K-weighting filter coefficients for any sample rate, as derived by
+ * libebur128 from the 48 kHz ones in BS.1770. */
+static void ap_kfilter_init(struct ap_kfilter *kf, size_t sample_rate)
+{
+	double fs = (double)sample_rate;
+	double f0 = 1681.974450955533;
+	double g = 3.999843853973347;
+	double q = 0.7071752369554196;
+	double k = tan(LN_PI * f0 / fs);
+	double vh = pow(10.0, g / 20.0);
+	double vb = pow(vh, 0.4996667741545416);
+	double a0 = 1.0 + k / q + k * k;
+
+	kf->b[0][0] = (vh + vb * k / q + k * k) / a0;
+	kf->b[0][1] = 2.0 * (k * k - vh) / a0;
+	kf->b[0][2] = (vh - vb * k / q + k * k) / a0;
+	kf->a[0][0] = 1.0;
+	kf->a[0][1] = 2.0 * (k * k - 1.0) / a0;
+	kf->a[0][2] = (1.0 - k / q + k * k) / a0;
+
+	f0 = 38.13547087602444;
+	q = 0.5003270373238773;
+	k = tan(LN_PI * f0 / fs);
+	a0 = 1.0 + k / q + k * k;
+
+	kf->b[1][0] = 1.0;
+	kf->b[1][1] = -2.0;
+	kf->b[1][2] = 1.0;
+	kf->a[1][0] = 1.0;
+	kf->a[1][1] = 2.0 * (k * k - 1.0) / a0;
+	kf->a[1][2] = (1.0 - k / q + k * k) / a0;
+}
+
+static inline double ap_loudness_of(double power)
+{
+	return power > 0.0 ? -0.691 + 10.0 * log10(power) : LN_SILENCE;
+}
+
+static inline double ap_meter_integrated(const struct ap_loudness *m)
+{
+	return m->blocks ? ap_loudness_of(m->sum / (double)m->blocks) : LN_SILENCE;
+}
+
+/* A 400 ms block is complete: count it unless it is silence, or a pause well
+ * below what has been heard so far. */
+static void ap_meter_block(struct ap_loudness *m)
+{
+	double power = 0.0;
+	double lufs;
+
+	for (size_t i = 0; i < LN_SUB_BLOCKS; i++)
+		power += m->ring[i];
+
+	power /= (double)LN_SUB_BLOCKS;
+	lufs = ap_loudness_of(power);
+
+	if (lufs < LN_ABS_GATE)
+		return;
+	if (m->blocks >= LN_MIN_BLOCKS && lufs < ap_meter_integrated(m) + LN_REL_GATE)
+		return;
+
+	m->sum += power;
+	m->blocks++;
+}
+
+/* Runs a packet of a file's own audio, before anything is done to its level,
+ * through the meter. Expects the mixer's lock to be held. */
+static void ap_meter_feed(struct ap_audio *a, struct ap_loudness *m, const struct audio_data *audio, size_t channels)
+{
+	const struct ap_kfilter *kf = &a->kfilter;
+	size_t sub_len = a->sample_rate / 10;
+	/* the LFE channel of 5.1 and 7.1 is left out of the measurement */
+	size_t lfe = channels >= 6 ? 3 : MAX_AUDIO_CHANNELS;
+
+	if (!sub_len)
+		return;
+
+	for (size_t i = 0; i < audio->frames; i++) {
+		for (size_t ch = 0; ch < channels; ch++) {
+			const float *in = (const float *)audio->data[ch];
+			double *z = m->z[ch];
+			double x, y, w;
+
+			if (!in || ch == lfe)
+				continue;
+
+			x = (double)in[i];
+
+			y = kf->b[0][0] * x + z[0];
+			z[0] = kf->b[0][1] * x - kf->a[0][1] * y + z[1];
+			z[1] = kf->b[0][2] * x - kf->a[0][2] * y;
+
+			w = kf->b[1][0] * y + z[2];
+			z[2] = kf->b[1][1] * y - kf->a[1][1] * w + z[3];
+			z[3] = kf->b[1][2] * y - kf->a[1][2] * w;
+
+			m->sub_energy += w * w;
+		}
+
+		if (++m->sub_frames < sub_len)
+			continue;
+
+		m->ring[m->ring_pos] = m->sub_energy / (double)sub_len;
+		m->ring_pos = (m->ring_pos + 1) % LN_SUB_BLOCKS;
+		if (m->ring_num < LN_SUB_BLOCKS)
+			m->ring_num++;
+		if (m->ring_num == LN_SUB_BLOCKS)
+			ap_meter_block(m);
+
+		m->sub_energy = 0.0;
+		m->sub_frames = 0;
+	}
+}
+
+/* What a file wants to be played at to land on the target, in dB, or 0 while
+ * there is not enough of it measured to tell. Expects the mixer's lock to be
+ * held. */
+static double ap_norm_target_db(const struct ap_audio *a, const struct ap_loudness *m)
+{
+	double db;
+
+	if (!a->normalize || m->blocks < LN_MIN_BLOCKS)
+		return 0.0;
+
+	db = a->target_lufs - ap_meter_integrated(m);
+
+	if (db > a->max_boost_db)
+		db = a->max_boost_db;
+	else if (db < -LN_MAX_CUT_DB)
+		db = -LN_MAX_CUT_DB;
+
+	return db;
+}
+
+static struct ap_loudness_record *ap_record_find(struct ap_audio *a, const char *path)
+{
+	for (size_t i = 0; i < a->records.num; i++) {
+		if (strcmp(a->records.array[i].path, path) == 0)
+			return &a->records.array[i];
+	}
+
+	return NULL;
+}
+
+/* Remembers how loud a file measured. Expects the mixer's lock to be held. */
+static void ap_record_save(struct ap_audio *a, const char *path, const struct ap_loudness *m)
+{
+	struct ap_loudness_record *rec;
+
+	if (!path || !m->blocks)
+		return;
+
+	rec = ap_record_find(a, path);
+	if (!rec) {
+		if (a->records.num >= LN_MAX_RECORDS)
+			return;
+
+		rec = da_push_back_new(a->records);
+		rec->path = bstrdup(path);
+	}
+
+	rec->sum = m->sum;
+	rec->blocks = m->blocks;
+}
+
+/* Sets a deck up for a file that is just being picked up, starting from what
+ * is remembered of it. Expects the mixer's lock to be held. */
+static void ap_deck_seed(struct ap_audio *a, struct ap_deck *deck)
+{
+	struct ap_loudness_record *rec = deck->path ? ap_record_find(a, deck->path) : NULL;
+
+	if (rec) {
+		deck->meter.sum = rec->sum;
+		deck->meter.blocks = rec->blocks;
+	}
+
+	/* a file that has been measured before starts at its level rather than
+	 * gliding into it */
+	deck->norm_db = ap_norm_target_db(a, &deck->meter);
+}
+
+/* ---- mixing ---- */
+
+/* Throws away what the mixer is holding and sets the format it works in.
+ * Expects the mixer's lock to be held. */
+static void ap_mix_reset(struct ap_audio *a, size_t channels, size_t sample_rate)
+{
+	for (size_t ch = 0; ch < MAX_AUDIO_CHANNELS; ch++) {
+		bfree(a->buf[ch]);
+		a->buf[ch] = NULL;
+	}
+
+	a->capacity = 0;
+	a->frames = 0;
+	a->ts = 0;
+	a->have = false;
+	a->next_ts = 0;
+	a->flushed = false;
+	a->channels = channels;
+	a->sample_rate = sample_rate;
+
+	if (sample_rate && sample_rate != a->kfilter_rate) {
+		ap_kfilter_init(&a->kfilter, sample_rate);
+		a->kfilter_rate = sample_rate;
+	}
+}
+
+/* Makes room for 'frames' samples and clears whatever of them is new, so that
+ * a gap between two items is silence rather than the last thing that stood
+ * there. Returns false when that is more than the mixer will hold. Expects the
+ * mixer's lock to be held. */
+static bool ap_mix_reserve(struct ap_audio *a, size_t frames)
+{
+	size_t limit = (size_t)ap_ns_to_frames(a->sample_rate, AP_MIX_MAX_NS);
+
+	if (!a->channels || frames > limit)
+		return false;
+
+	if (frames > a->capacity) {
+		size_t capacity = a->capacity ? a->capacity : 1024;
+
+		while (capacity < frames)
+			capacity *= 2;
+		if (capacity > limit)
+			capacity = limit;
+
+		for (size_t ch = 0; ch < a->channels; ch++) {
+			a->buf[ch] = brealloc(a->buf[ch], capacity * sizeof(float));
+			memset(a->buf[ch] + a->frames, 0, (capacity - a->frames) * sizeof(float));
+		}
+
+		a->capacity = capacity;
+	} else if (frames > a->frames) {
+		for (size_t ch = 0; ch < a->channels; ch++)
+			memset(a->buf[ch] + a->frames, 0, (frames - a->frames) * sizeof(float));
+	}
+
+	if (frames > a->frames)
+		a->frames = frames;
+
+	return true;
+}
+
+/* Hands OBS whatever of the mix nothing is going to add to any more: everything
+ * up to the point the source that is furthest behind has reached, and never
+ * more than the hold behind the clock. Expects the mixer's lock to be held. */
+static void ap_mix_flush(struct ad_playlist *ap)
+{
+	struct ap_audio *a = &ap->audio;
+	struct obs_source_audio out = {0};
+	uint64_t now;
+	uint64_t horizon;
+	size_t frames;
+
+	if (!a->have || !a->frames || !a->sample_rate || !a->channels)
+		return;
+
+	now = os_gettime_ns();
+	horizon = a->ts + ap_frames_to_ns(a->sample_rate, a->frames);
+
+	for (size_t i = 0; i < AP_NUM_DECKS; i++) {
+		struct ap_deck *deck = &a->deck[i];
+
+		if (!deck->source || !deck->producing)
+			continue;
+
+		if (now - deck->arrived > AP_DECK_IDLE_NS) {
+			deck->producing = false;
+			continue;
+		}
+
+		if (deck->end_ts < horizon)
+			horizon = deck->end_ts;
+	}
+
+	if (now > AP_MIX_HOLD_NS && horizon < now - AP_MIX_HOLD_NS)
+		horizon = now - AP_MIX_HOLD_NS;
+
+	if (horizon <= a->ts)
+		return;
+
+	frames = (size_t)ap_ns_to_frames(a->sample_rate, horizon - a->ts);
+	if (frames > a->frames)
+		frames = a->frames;
+	if (!frames)
+		return;
+
+	for (size_t ch = 0; ch < a->channels; ch++)
+		out.data[ch] = (const uint8_t *)a->buf[ch];
+
+	out.frames = (uint32_t)frames;
+	out.speakers = a->speakers;
+	out.format = AUDIO_FORMAT_FLOAT_PLANAR;
+	out.samples_per_sec = (uint32_t)a->sample_rate;
+	out.timestamp = a->ts;
+
+	obs_source_output_audio(ap->source, &out);
+
+	a->ts += ap_frames_to_ns(a->sample_rate, frames);
+	a->next_ts = a->ts;
+	a->flushed = true;
+	a->frames -= frames;
+
+	if (a->frames) {
+		for (size_t ch = 0; ch < a->channels; ch++)
+			memmove(a->buf[ch], a->buf[ch] + frames, a->frames * sizeof(float));
+	} else {
+		a->have = false;
+	}
+}
+
+/* The level a playlist file is played at on top of the playlist volume and the
+ * transition: its normalization, eased toward where the measurement says it
+ * should be, and held back where boosting this packet would take it near
+ * clipping. Expects the mixer's lock to be held. */
+static float ap_deck_norm_gain(struct ap_audio *a, struct ap_deck *deck, const struct audio_data *audio, size_t skipped,
+			       size_t frames, size_t channels, float level)
+{
+	double target = ap_norm_target_db(a, &deck->meter);
+	double dt = (double)audio->frames / (double)a->sample_rate;
+	float norm;
+	float peak = 0.0f;
+	float scale = deck->gain * level;
+
+	deck->norm_db += (target - deck->norm_db) * (1.0 - exp(-dt / LN_SMOOTH_SECONDS));
+	norm = (float)pow(10.0, deck->norm_db / 20.0);
+
+	if (norm <= 1.0f || scale <= 0.0f)
+		return norm;
+
+	for (size_t ch = 0; ch < channels; ch++) {
+		const float *in = (const float *)audio->data[ch];
+
+		if (!in)
+			continue;
+
+		for (size_t i = skipped; i < skipped + frames; i++) {
+			float v = fabsf(in[i]);
+			if (v > peak)
+				peak = v;
+		}
+	}
+
+	if (peak * scale * norm > LN_PEAK_CEILING) {
+		float limited = LN_PEAK_CEILING / (peak * scale);
+		norm = limited < 1.0f ? 1.0f : limited;
+	}
+
+	return norm;
+}
+
+/* Takes a packet of one source's audio into the mix. Runs on that source's own
+ * media thread, which is why the mixer has a lock of its own: ap->mutex is held
+ * across work that hands sources to the transition, and audio cannot wait on
+ * it. */
+static void ap_mix_submit(struct ad_playlist *ap, obs_source_t *source, const struct audio_data *audio, bool muted)
+{
+	audio_t *obs_audio = obs_get_audio();
+	const struct audio_output_info *info;
+	struct ap_audio *a = &ap->audio;
+	struct ap_deck *deck = NULL;
+	size_t channels;
+	size_t sample_rate;
+
+	if (!obs_audio || !audio || !audio->frames)
+		return;
+
+	info = audio_output_get_info(obs_audio);
+	channels = audio_output_get_channels(obs_audio);
+	sample_rate = audio_output_get_sample_rate(obs_audio);
+
+	if (!info || !channels || channels > MAX_AUDIO_CHANNELS || !sample_rate)
+		return;
+
+	pthread_mutex_lock(&a->mutex);
+
+	for (size_t i = 0; i < AP_NUM_DECKS; i++) {
+		if (a->deck[i].source == source) {
+			deck = &a->deck[i];
+			break;
+		}
+	}
+
+	/* the source was taken off the mixer between the packet being handed
+	 * over and this getting to look at it */
+	if (!deck)
+		goto unlock;
+
+	if (a->channels != channels || a->sample_rate != sample_rate)
+		ap_mix_reset(a, channels, sample_rate);
+
+	a->speakers = info->speakers;
+
+	if (!deck->from_transition)
+		ap_meter_feed(a, &deck->meter, audio, channels);
+
+	{
+		/* put the packet on the clock the mixer works in */
+		uint64_t arrived = os_gettime_ns();
+		int64_t raw = (int64_t)audio->timestamp;
+		uint64_t ts;
+		size_t frames = audio->frames;
+		size_t skipped = 0;
+		uint64_t floor_ts = a->flushed ? a->next_ts : 0;
+		bool have_floor = a->flushed;
+
+		if (!deck->anchored) {
+			deck->offset = (int64_t)arrived - raw;
+			deck->anchored = true;
+		} else {
+			uint64_t placed = (uint64_t)(raw + deck->offset);
+			uint64_t drift = placed > arrived ? placed - arrived : arrived - placed;
+
+			if (drift > AP_DECK_RESYNC_NS)
+				deck->offset = (int64_t)arrived - raw;
+		}
+
+		ts = (uint64_t)(raw + deck->offset);
+
+		/* Never mix behind what has already gone out, or behind what is
+		 * being held: a packet that turns up late is trimmed rather
+		 * than mixed in under audio that has moved on. */
+		if (a->have && (!have_floor || a->ts > floor_ts)) {
+			floor_ts = a->ts;
+			have_floor = true;
+		}
+
+		if (have_floor && ts < floor_ts) {
+			skipped = (size_t)ap_ns_to_frames(sample_rate, floor_ts - ts);
+
+			if (skipped >= frames) {
+				skipped = frames;
+				frames = 0;
+			} else {
+				frames -= skipped;
+			}
+
+			ts = floor_ts;
+		}
+
+		if (frames) {
+			size_t offset;
+			float level = a->volume;
+			float norm = 1.0f;
+			float target;
+			float step;
+
+			if (!a->have) {
+				a->ts = ts;
+				a->frames = 0;
+				a->have = true;
+			}
+
+			offset = (size_t)ap_ns_to_frames(sample_rate, ts - a->ts);
+
+			if (!ap_mix_reserve(a, offset + frames)) {
+				/* Further ahead than the mixer will hold, which
+				 * takes a source whose timestamps have run away.
+				 * Start again from this packet. */
+				ap_mix_reset(a, channels, sample_rate);
+				a->ts = ts;
+				a->have = true;
+				offset = 0;
+
+				if (!ap_mix_reserve(a, frames))
+					frames = 0;
+			}
+
+			if (!deck->from_transition)
+				norm = ap_deck_norm_gain(a, deck, audio, skipped, frames, channels, level);
+
+			target = muted ? 0.0f : deck->gain * level * norm;
+			step = frames ? (target - deck->applied_gain) / (float)frames : 0.0f;
+
+			for (size_t ch = 0; ch < channels && frames; ch++) {
+				const float *in = (const float *)audio->data[ch];
+				float *out = a->buf[ch] + offset;
+				float gain = deck->applied_gain;
+
+				if (!in)
+					continue;
+
+				in += skipped;
+
+				for (size_t i = 0; i < frames; i++) {
+					out[i] += in[i] * gain;
+					gain += step;
+				}
+			}
+
+			if (frames)
+				deck->applied_gain = target;
+		}
+
+		deck->end_ts = ts + ap_frames_to_ns(sample_rate, frames);
+		deck->arrived = arrived;
+		deck->producing = true;
+	}
+
+	ap_mix_flush(ap);
+
+unlock:
+	pthread_mutex_unlock(&a->mutex);
+}
+
+static void ap_audio_capture(void *param, obs_source_t *source, const struct audio_data *audio, bool muted)
+{
+	ap_mix_submit(param, source, audio, muted);
+}
+
+/* ---- following the transition ---- */
+
+/* What the transition on screen does to the audio of the two items it holds,
+ * read alongside the transition itself. */
+struct ap_tr_audio {
+	bool running;
+	bool is_stinger;
+	bool to_color;
+	uint32_t stinger_point_ms;
+	float switch_point;
+};
+
+static obs_source_t *get_transition_audio(struct ad_playlist *ap, struct ap_tr_audio *info)
+{
+	obs_source_t *tr;
+
+	pthread_mutex_lock(&ap->mutex);
+	tr = obs_source_get_ref(ap->transition);
+	info->running = os_atomic_load_bool(&ap->tr_running);
+	info->is_stinger = ap->use_stinger;
+	info->to_color = ap->use_to_color;
+	info->stinger_point_ms = ap->stinger_point_ms;
+	info->switch_point = ap->switch_point;
+	pthread_mutex_unlock(&ap->mutex);
+
+	return tr;
+}
+
+static inline float ap_clamp01(float v)
+{
+	return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+}
+
+static inline float ap_smoothstep(float edge0, float edge1, float x)
+{
+	float t = edge1 > edge0 ? ap_clamp01((x - edge0) / (edge1 - edge0)) : (x >= edge1 ? 1.0f : 0.0f);
+	return t * t * (3.0f - 2.0f * t);
+}
+
+static inline float ap_lerp(float a, float b, float x)
+{
+	return a + (b - a) * x;
+}
+
+/* What the two halves of a running transition are played at, worked out the
+ * way the transition itself works them out: a stinger (fading out and back in,
+ * its default) takes the outgoing item down to nothing by its transition point
+ * and brings the incoming one up from there, fade to color dips through
+ * silence at its switch point, and everything else crosses the two over.
+ * 'stinger_ms' is the length of the stinger video, 0 when it is not known. */
+static void ap_transition_gains(const struct ap_tr_audio *info, int64_t stinger_ms, float t, float *out, float *in)
+{
+	t = ap_clamp01(t);
+
+	if (info->is_stinger) {
+		float point = stinger_ms > 0 ? (float)info->stinger_point_ms / (float)stinger_ms : 0.5f;
+
+		if (point < 0.001f)
+			point = 0.001f;
+		else if (point > 0.999f)
+			point = 0.999f;
+
+		*out = 1.0f - ap_clamp01(t / point);
+		*in = 1.0f - ap_clamp01((1.0f - t) / (1.0f - point));
+		return;
+	}
+
+	if (info->to_color) {
+		float sp = info->switch_point;
+
+		*out = ap_lerp(1.0f - t, 0.0f, ap_smoothstep(0.0f, sp, t));
+		*in = ap_lerp(0.0f, t, ap_smoothstep(sp, 1.0f, t));
+		return;
+	}
+
+	*out = 1.0f - t;
+	*in = t;
+}
+
+/* What the mixer should be listening to. */
+struct ap_audio_scan {
+	obs_source_t *want[AP_NUM_DECKS];
+	float gain[AP_NUM_DECKS];
+	bool from_transition[AP_NUM_DECKS];
+	char *path[AP_NUM_DECKS];
+	size_t num;
+	/* the longest media the transition plays of its own: the stinger */
+	int64_t own_ms;
+};
+
+static size_t ap_audio_scan_find(const struct ap_audio_scan *scan, obs_source_t *source)
+{
+	for (size_t i = 0; i < scan->num; i++) {
+		if (scan->want[i] == source)
+			return i;
+	}
+
+	return DARRAY_INVALID;
+}
+
+/* A source that stands in more than one place is played once, at everything it
+ * is asked for put together: the two halves of a transition are the same item
+ * whenever a one item playlist loops. */
+static size_t ap_audio_scan_add(struct ap_audio_scan *scan, obs_source_t *source, float gain, bool from_transition)
+{
+	size_t found;
+
+	if (!source)
+		return DARRAY_INVALID;
+
+	found = ap_audio_scan_find(scan, source);
+	if (found != DARRAY_INVALID) {
+		scan->gain[found] += gain;
+		return found;
+	}
+
+	if (scan->num == AP_NUM_DECKS)
+		return DARRAY_INVALID;
+
+	scan->want[scan->num] = obs_source_get_ref(source);
+	scan->gain[scan->num] = gain;
+	scan->from_transition[scan->num] = from_transition;
+	scan->path[scan->num] = NULL;
+
+	return scan->num++;
+}
+
+/* Picks up whatever the transition plays on top of the two halves it holds,
+ * which for a stinger is its own video and the matte alongside it. */
+static void ap_audio_scan_transition(obs_source_t *parent, obs_source_t *child, void *param)
+{
+	struct ap_audio_scan *scan = param;
+	int64_t ms;
+
+	UNUSED_PARAMETER(parent);
+
+	if (ap_audio_scan_find(scan, child) != DARRAY_INVALID)
+		return;
+
+	ms = obs_source_media_get_duration(child);
+	if (ms > scan->own_ms)
+		scan->own_ms = ms;
+
+	ap_audio_scan_add(scan, child, 1.0f, true);
+}
+
+/* Finds the playlist file a source plays. Expects ap->mutex to be held. */
+static const char *ap_item_path(struct ad_playlist *ap, obs_source_t *source)
+{
+	for (size_t i = 0; i < ap->items.num; i++) {
+		if (ap->items.array[i].source == source)
+			return ap->items.array[i].path;
+	}
+
+	return NULL;
+}
+
+/* A file that has left the mixer, for the log. */
+struct ap_audio_report {
+	char *path;
+	double lufs;
+	double db;
+	bool measured;
+};
+
+/* Takes a deck off its source. Expects the mixer's lock to be held. */
+static void ap_deck_retire(struct ap_audio *a, struct ap_deck *deck, struct ap_audio_report *report)
+{
+	ap_record_save(a, deck->path, &deck->meter);
+
+	report->path = deck->path;
+	report->measured = deck->path && deck->meter.blocks >= LN_MIN_BLOCKS;
+	report->lufs = ap_meter_integrated(&deck->meter);
+	report->db = deck->norm_db;
+
+	memset(deck, 0, sizeof(*deck));
+}
+
+static void ap_audio_report_log(struct ad_playlist *ap, struct ap_audio_report *report, bool normalize)
+{
+	if (!report->path)
+		return;
+
+	if (report->measured && normalize)
+		info("audio: '%s' measured %.1f LUFS, played at %+.1f dB", report->path, report->lufs, report->db);
+	else if (report->measured)
+		info("audio: '%s' measured %.1f LUFS", report->path, report->lufs);
+
+	bfree(report->path);
+	report->path = NULL;
+}
+
+/* Points the mixer at the sources the transition on screen is playing and sets
+ * what each of them is played at. Runs on the tick with no lock held: putting a
+ * tap on a source takes that source's own lock, so it is never done under the
+ * mixer's. */
+static void ap_audio_sync(struct ad_playlist *ap)
+{
+	struct ap_audio *a = &ap->audio;
+	struct ap_tr_audio info;
+	struct ap_audio_scan scan = {0};
+	struct ap_audio_report reports[AP_NUM_DECKS] = {0};
+	bool placed[AP_NUM_DECKS] = {false};
+	obs_source_t *taken[AP_NUM_DECKS] = {NULL};
+	obs_source_t *dropped[AP_NUM_DECKS] = {NULL};
+	obs_source_t *transition = get_transition_audio(ap, &info);
+	bool normalize;
+
+	if (transition) {
+		obs_source_t *from = obs_transition_get_source(transition, OBS_TRANSITION_SOURCE_A);
+		obs_source_t *into = NULL;
+		size_t from_idx;
+		size_t into_idx = DARRAY_INVALID;
+		bool active;
+
+		/* An incoming source only stands in the transition while it is
+		 * running; one to nothing (hiding at the end of the playlist)
+		 * has none, and is known by the flag alone. */
+		into = obs_transition_get_source(transition, OBS_TRANSITION_SOURCE_B);
+		active = into || info.running;
+
+		from_idx = ap_audio_scan_add(&scan, from, 0.0f, false);
+		into_idx = ap_audio_scan_add(&scan, into, 0.0f, false);
+
+		/* the halves are in already, so this only adds what the
+		 * transition brought along itself */
+		obs_source_enum_active_sources(transition, ap_audio_scan_transition, &scan);
+
+		if (active) {
+			float from_gain;
+			float into_gain;
+
+			ap_transition_gains(&info, scan.own_ms, obs_transition_get_time(transition), &from_gain,
+					    &into_gain);
+
+			if (from_idx != DARRAY_INVALID)
+				scan.gain[from_idx] += from_gain;
+			if (into_idx != DARRAY_INVALID)
+				scan.gain[into_idx] += into_gain;
+		} else if (from_idx != DARRAY_INVALID) {
+			scan.gain[from_idx] = 1.0f;
+		}
+
+		obs_source_release(from);
+		obs_source_release(into);
+		obs_source_release(transition);
+	}
+
+	/* the playlist files, so what they measure can be remembered */
+	pthread_mutex_lock(&ap->mutex);
+	for (size_t j = 0; j < scan.num; j++) {
+		const char *path = scan.from_transition[j] ? NULL : ap_item_path(ap, scan.want[j]);
+		scan.path[j] = path ? bstrdup(path) : NULL;
+	}
+	pthread_mutex_unlock(&ap->mutex);
+
+	for (size_t i = 0; i < AP_NUM_DECKS; i++) {
+		obs_source_t *held = a->deck[i].source;
+
+		if (held && ap_audio_scan_find(&scan, held) == DARRAY_INVALID) {
+			obs_source_remove_audio_capture_callback(held, ap_audio_capture, ap);
+			dropped[i] = held;
+		}
+	}
+
+	pthread_mutex_lock(&a->mutex);
+
+	normalize = a->normalize;
+
+	for (size_t i = 0; i < AP_NUM_DECKS; i++) {
+		if (dropped[i])
+			ap_deck_retire(a, &a->deck[i], &reports[i]);
+	}
+
+	/* a source that is already tapped keeps its deck, so a crossfade that
+	 * is running rides on rather than starting over from silence */
+	for (size_t j = 0; j < scan.num; j++) {
+		for (size_t i = 0; i < AP_NUM_DECKS; i++) {
+			if (a->deck[i].source != scan.want[j])
+				continue;
+
+			a->deck[i].gain = scan.gain[j];
+			a->deck[i].from_transition = scan.from_transition[j];
+			placed[j] = true;
+			break;
+		}
+	}
+
+	for (size_t j = 0; j < scan.num; j++) {
+		if (placed[j])
+			continue;
+
+		for (size_t i = 0; i < AP_NUM_DECKS; i++) {
+			struct ap_deck *deck = &a->deck[i];
+
+			if (deck->source)
+				continue;
+
+			memset(deck, 0, sizeof(*deck));
+			deck->source = obs_source_get_ref(scan.want[j]);
+			deck->gain = scan.gain[j];
+			deck->from_transition = scan.from_transition[j];
+			deck->path = scan.path[j];
+			scan.path[j] = NULL;
+			ap_deck_seed(a, deck);
+
+			taken[i] = deck->source;
+			placed[j] = true;
+			break;
+		}
+	}
+
+	pthread_mutex_unlock(&a->mutex);
+
+	for (size_t i = 0; i < AP_NUM_DECKS; i++) {
+		if (!taken[i])
+			continue;
+
+		/* Everything the playlist listens to is played by the playlist
+		 * and by nothing else. The items are opened without mixers of
+		 * their own; a stinger's own video is not the playlist's to
+		 * open, so it is quietened here as it is picked up. */
+		obs_source_set_audio_mixers(taken[i], 0);
+		obs_source_add_audio_capture_callback(taken[i], ap_audio_capture, ap);
+	}
+
+	for (size_t i = 0; i < AP_NUM_DECKS; i++) {
+		if (dropped[i])
+			obs_source_release(dropped[i]);
+		ap_audio_report_log(ap, &reports[i], normalize);
+	}
+
+	for (size_t j = 0; j < scan.num; j++) {
+		obs_source_release(scan.want[j]);
+		bfree(scan.path[j]);
+	}
+
+	/* a source that has gone quiet, or gone entirely, leaves the last of its
+	 * audio behind; nothing is going to add to it, so it goes out now */
+	pthread_mutex_lock(&a->mutex);
+	ap_mix_flush(ap);
+	pthread_mutex_unlock(&a->mutex);
+}
+
+/* takes every tap off and drops what the mixer is holding */
+static void ap_audio_free(struct ad_playlist *ap)
+{
+	struct ap_audio *a = &ap->audio;
+	obs_source_t *held[AP_NUM_DECKS];
+
+	for (size_t i = 0; i < AP_NUM_DECKS; i++) {
+		held[i] = a->deck[i].source;
+
+		if (held[i])
+			obs_source_remove_audio_capture_callback(held[i], ap_audio_capture, ap);
+	}
+
+	pthread_mutex_lock(&a->mutex);
+	for (size_t i = 0; i < AP_NUM_DECKS; i++)
+		bfree(a->deck[i].path);
+	memset(a->deck, 0, sizeof(a->deck));
+	ap_mix_reset(a, 0, 0);
+	pthread_mutex_unlock(&a->mutex);
+
+	for (size_t i = 0; i < AP_NUM_DECKS; i++) {
+		if (held[i])
+			obs_source_release(held[i]);
+	}
+}
+
+/* ------------------------------------------------------------------------- */
 /* source callbacks                                                           */
 
 static const char *ap_get_name(void *unused)
@@ -1400,15 +2522,26 @@ static void ap_destroy(void *data)
 {
 	struct ad_playlist *ap = data;
 
+	/* the items stop being tapped before anything lets go of them */
+	ap_audio_free(ap);
+
 	if (ap->stop_pending)
 		obs_source_release(ap->stop_pending);
 
+	if (ap->transition)
+		connect_transition(ap, ap->transition, false);
 	obs_source_release(ap->transition);
 	free_items(&ap->items);
 	da_free(ap->order);
 	bfree(ap->tr_type);
 	bfree(ap->tr_settings_sig);
 	free_paths(&ap->configured_paths);
+
+	for (size_t i = 0; i < ap->audio.records.num; i++)
+		bfree(ap->audio.records.array[i].path);
+	da_free(ap->audio.records);
+
+	pthread_mutex_destroy(&ap->audio.mutex);
 	pthread_mutex_destroy(&ap->mutex);
 	bfree(ap);
 }
@@ -1424,14 +2557,21 @@ static void *ap_create(obs_data_t *settings, obs_source_t *source)
 	ap->scale_type = OBS_TRANSITION_SCALE_ASPECT;
 	ap->alignment = OBS_ALIGN_CENTER;
 	ap->auto_size = true;
-	ap->volume = 1.0f;
-	ap->audio_stage_logged = -1; /* nothing reported yet - the first report always lands */
+	ap->audio.volume = 1.0f;
 
 	da_init(ap->items);
 	da_init(ap->order);
+	da_init(ap->audio.records);
 
 	pthread_mutex_init_value(&ap->mutex);
 	if (pthread_mutex_init_recursive(&ap->mutex) != 0) {
+		bfree(ap);
+		return NULL;
+	}
+
+	pthread_mutex_init_value(&ap->audio.mutex);
+	if (pthread_mutex_init(&ap->audio.mutex, NULL) != 0) {
+		pthread_mutex_destroy(&ap->mutex);
 		bfree(ap);
 		return NULL;
 	}
@@ -1540,58 +2680,6 @@ static bool item_reached_end(struct ad_playlist *ap, struct ad_item *item, bool 
 	return time >= duration - (int64_t)lead_ms;
 }
 
-static const char *audio_stage_name(long stage)
-{
-	switch ((enum ap_audio_stage)stage) {
-	case AP_AUDIO_OK:
-		return "mixing";
-	case AP_AUDIO_NO_TRANSITION:
-		return "no transition to pull from";
-	case AP_AUDIO_TR_PENDING:
-		return "transition handed over no audio";
-	case AP_AUDIO_TR_NO_TS:
-		return "transition audio has no timestamp";
-	}
-
-	return "unknown";
-}
-
-/*
- * Report where the audio chain got, and what the item itself is handing to the
- * transition, whenever either changes. Between them the two tell apart a media
- * file that is producing no audio at all, a transition that is not passing it
- * on, and a playlist that is mixing audio that goes silent further downstream.
- *
- * Mutex must be held.
- */
-static void report_audio_state(struct ad_playlist *ap, struct ad_item *item, float seconds)
-{
-	long stage;
-
-	ap->audio_diag_timer += seconds;
-	if (ap->audio_diag_timer < AUDIO_DIAG_INTERVAL)
-		return;
-
-	ap->audio_diag_timer = 0.0f;
-
-	/* only meaningful once the item is actually rolling */
-	if (!item->is_video || !ap->started)
-		return;
-
-	stage = os_atomic_load_long(&ap->audio_stage);
-	if (stage == ap->audio_stage_logged)
-		return;
-
-	ap->audio_stage_logged = stage;
-
-	if (stage == AP_AUDIO_OK)
-		info("audio: mixing '%s' at %d%%", item->path, (int)(ap->volume * 100.0f + 0.5f));
-	else
-		warn("audio: %s for '%s' (item audio %s, timestamp %llu)", audio_stage_name(stage), item->path,
-		     obs_source_audio_pending(item->source) ? "pending" : "ready",
-		     (unsigned long long)obs_source_get_audio_timestamp(item->source));
-}
-
 static void ap_video_tick(void *data, float seconds)
 {
 	struct ad_playlist *ap = data;
@@ -1639,8 +2727,6 @@ static void ap_video_tick(void *data, float seconds)
 
 	ap->elapsed += seconds;
 
-	report_audio_state(ap, item, seconds);
-
 	last_item = !ap->loop && ap->order_pos + 1 >= ap->order.num;
 
 	if (item_reached_end(ap, item, last_item && !ap->hide_when_done))
@@ -1648,64 +2734,11 @@ static void ap_video_tick(void *data, float seconds)
 
 finish:
 	pthread_mutex_unlock(&ap->mutex);
-}
 
-static inline enum ap_audio_stage render_child_audio(obs_source_t *transition, uint64_t *ts_out,
-						     struct obs_source_audio_mix *audio_output, uint32_t mixers,
-						     size_t channels, float volume)
-{
-	struct obs_source_audio_mix child_audio;
-	uint64_t source_ts;
-
-	if (obs_source_audio_pending(transition))
-		return AP_AUDIO_TR_PENDING;
-
-	source_ts = obs_source_get_audio_timestamp(transition);
-	if (!source_ts)
-		return AP_AUDIO_TR_NO_TS;
-
-	obs_source_get_audio_mix(transition, &child_audio);
-
-	for (size_t mix = 0; mix < MAX_AUDIO_MIXES; mix++) {
-		if ((mixers & (1 << mix)) == 0)
-			continue;
-
-		for (size_t ch = 0; ch < channels; ch++) {
-			float *out = audio_output->output[mix].data[ch];
-			float *in = child_audio.output[mix].data[ch];
-
-			if (volume == 1.0f) {
-				memcpy(out, in, AUDIO_OUTPUT_FRAMES * sizeof(float));
-			} else {
-				for (size_t i = 0; i < AUDIO_OUTPUT_FRAMES; i++)
-					out[i] = in[i] * volume;
-			}
-		}
-	}
-
-	*ts_out = source_ts;
-	return AP_AUDIO_OK;
-}
-
-static bool ap_audio_render(void *data, uint64_t *ts_out, struct obs_source_audio_mix *audio_output, uint32_t mixers,
-			    size_t channels, size_t sample_rate)
-{
-	struct ad_playlist *ap = data;
-	obs_source_t *transition = get_transition(ap);
-	enum ap_audio_stage stage;
-
-	if (!transition) {
-		os_atomic_set_long(&ap->audio_stage, AP_AUDIO_NO_TRANSITION);
-		return false;
-	}
-
-	stage = render_child_audio(transition, ts_out, audio_output, mixers, channels, ap->volume);
-	obs_source_release(transition);
-
-	os_atomic_set_long(&ap->audio_stage, (long)stage);
-
-	UNUSED_PARAMETER(sample_rate);
-	return stage == AP_AUDIO_OK;
+	/* Follow the transition with the audio, after any switch above rather
+	 * than before it, so an item going up is listened to from the tick it
+	 * goes up. Taps are put on sources with no lock held. */
+	ap_audio_sync(ap);
 }
 
 static void ap_enum_sources(void *data, obs_source_enum_proc_t cb, void *param)
@@ -1782,6 +2815,9 @@ static void ap_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, S_PRELOAD, true);
 	obs_data_set_default_bool(settings, S_HW_DECODE, false);
 	obs_data_set_default_int(settings, S_VOLUME, 100);
+	obs_data_set_default_bool(settings, S_NORMALIZE, true);
+	obs_data_set_default_int(settings, S_NORM_TARGET, -18);
+	obs_data_set_default_int(settings, S_NORM_MAX_BOOST, 12);
 
 	obs_data_set_default_string(settings, S_TRANSITION, TR_FADE);
 	obs_data_set_default_int(settings, S_TR_DURATION, 500);
@@ -1822,6 +2858,18 @@ static bool transition_changed(obs_properties_t *props, obs_property_t *p, obs_d
 	return true;
 }
 
+static bool normalize_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+	bool on = obs_data_get_bool(settings, S_NORMALIZE);
+
+	UNUSED_PARAMETER(p);
+
+	obs_property_set_visible(obs_properties_get(props, S_NORM_TARGET), on);
+	obs_property_set_visible(obs_properties_get(props, S_NORM_MAX_BOOST), on);
+
+	return true;
+}
+
 /* clang-format off */
 static const char *media_filter =
 	"Media files (*.mp4 *.m4v *.mov *.mkv *.webm *.ts *.m2ts *.mts *.mpg *.mpeg *.avi *.flv *.wmv *.mxf *.3gp"
@@ -1843,6 +2891,7 @@ static obs_properties_t *ap_properties(void *data)
 {
 	obs_properties_t *props = obs_properties_create();
 	obs_properties_t *playback = obs_properties_create();
+	obs_properties_t *audio = obs_properties_create();
 	obs_properties_t *transition = obs_properties_create();
 	obs_properties_t *appearance = obs_properties_create();
 	struct ad_playlist *ap = data;
@@ -1882,13 +2931,30 @@ static obs_properties_t *ap_properties(void *data)
 	obs_properties_add_bool(playback, S_HIDE_DONE, T_HIDE_DONE);
 	obs_properties_add_bool(playback, S_RESTART_ON_SHOW, T_RESTART_ON_SHOW);
 
-	p = obs_properties_add_int_slider(playback, S_VOLUME, T_VOLUME, 0, 100, 1);
-	obs_property_int_set_suffix(p, " %");
-
 	obs_properties_add_bool(playback, S_PRELOAD, T_PRELOAD);
 	obs_properties_add_bool(playback, S_HW_DECODE, T_HW_DECODE);
 
 	obs_properties_add_group(props, S_GROUP_PLAYBACK, T_GROUP_PLAYBACK, OBS_GROUP_NORMAL, playback);
+
+	/* ----------------- audio ----------------- */
+
+	p = obs_properties_add_int_slider(audio, S_VOLUME, T_VOLUME, 0, 100, 1);
+	obs_property_int_set_suffix(p, " %");
+	obs_property_set_long_description(p, T_VOLUME_DESC);
+
+	p = obs_properties_add_bool(audio, S_NORMALIZE, T_NORMALIZE);
+	obs_property_set_long_description(p, T_NORMALIZE_DESC);
+	obs_property_set_modified_callback(p, normalize_changed);
+
+	p = obs_properties_add_int_slider(audio, S_NORM_TARGET, T_NORM_TARGET, -36, -6, 1);
+	obs_property_int_set_suffix(p, " LUFS");
+	obs_property_set_long_description(p, T_NORM_TARGET_DESC);
+
+	p = obs_properties_add_int_slider(audio, S_NORM_MAX_BOOST, T_NORM_MAX_BOOST, 0, 24, 1);
+	obs_property_int_set_suffix(p, " dB");
+	obs_property_set_long_description(p, T_NORM_MAX_BOOST_DESC);
+
+	obs_properties_add_group(props, S_GROUP_AUDIO, T_GROUP_AUDIO, OBS_GROUP_NORMAL, audio);
 
 	/* ----------------- transition ----------------- */
 
@@ -2041,7 +3107,13 @@ static enum gs_color_space ap_video_get_color_space(void *data, size_t count,
 struct obs_source_info ad_playlist_source_info = {
 	.id = "sponsor_ad_playlist",
 	.type = OBS_SOURCE_TYPE_INPUT,
-	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_COMPOSITE |
+	/* The playlist renders its picture itself and hands its audio over
+	 * itself, the way the browser source does. It is deliberately not
+	 * composite: obs_register_source() refuses OBS_SOURCE_AUDIO alongside
+	 * OBS_SOURCE_COMPOSITE, and without OBS_SOURCE_AUDIO there is no
+	 * playlist in the OBS audio mixer to fade, mute, monitor, filter or
+	 * route. The items are mixed by the audio section above instead. */
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_AUDIO | OBS_SOURCE_DO_NOT_DUPLICATE |
 			OBS_SOURCE_CONTROLLABLE_MEDIA,
 	.get_name = ap_get_name,
 	.create = ap_create,
@@ -2051,7 +3123,6 @@ struct obs_source_info ad_playlist_source_info = {
 	.hide = ap_hide,
 	.video_render = ap_video_render,
 	.video_tick = ap_video_tick,
-	.audio_render = ap_audio_render,
 	.enum_active_sources = ap_enum_sources,
 	.get_width = ap_get_width,
 	.get_height = ap_get_height,

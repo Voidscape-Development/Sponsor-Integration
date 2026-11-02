@@ -35,14 +35,32 @@ else is loaded as a media source.
 | **Shuffle order** | Shuffles the running order rather than picking at random, so every spot plays exactly once per pass. The order is reshuffled each pass, never repeating an item across the loop point. |
 | **Hide when the playlist ends** | With looping off, transition out to nothing at the end instead of holding the last frame. |
 | **Restart playlist when the source becomes visible** | Start from the first item every time the source is shown. With this off, showing the source resumes at the item it was on. |
-| **Volume** | Attenuates the audio of the whole playlist. Takes effect immediately without interrupting the item on screen. |
 | **Keep media files loaded** | Keeps each video open and its first frame decoded so items start instantly. Turn it off for very large playlists to save memory, at the cost of a short load when each item comes up. |
 | **Use hardware decoding** | Passed through to the underlying media sources. |
 
 The playlist only advances while the source is visible. A hidden Ad Playlist holds its position
 instead of burning through the rotation off screen.
 
-### Transition
+### Audio
+
+The Ad Playlist is a full audio source: it shows up in the OBS **Audio Mixer** with its own fader,
+mute, meter, monitoring, audio filters and track routing, just like a Media Source. The items'
+audio is mixed by the playlist itself and follows the transition, so a fade crossfades the audio,
+Fade to Color dips through silence at its switch point, and a Stinger fades the outgoing item out by
+its transition point and the incoming one back in (its own sound plays on top).
+
+| Setting | Description |
+|---|---|
+| **Volume** | Level of the whole playlist, applied before the mixer fader. Takes effect immediately without interrupting the item on screen. |
+| **Even out loudness between items** | *(on by default)* Measures each file's loudness the way broadcast does (ITU-R BS.1770 / EBU R128 — K-weighted and gated, so silence and quiet pauses don't count) and brings it toward the target: quiet spots are turned up, loud spots are turned down. |
+| **Target loudness** | The level every item is brought toward, in LUFS. Default −18. |
+| **Maximum boost** | How far a quiet file may be turned up, in dB. Default 12. Loud files can always be turned down (up to 30 dB). Boosting is held back wherever it would push a file into clipping. |
+
+A file is measured while it plays and its level eases in over its first couple of seconds. The
+measurement is remembered for the rest of the session, so from its second time around a file starts
+at exactly the right level. Each file's measured loudness and the gain applied are written to the
+OBS log when it leaves the screen.
+
 
 Choose between **Cut**, **Fade**, **Swipe**, **Slide**, **Fade to Color** and **Stinger**. The
 options for the selected transition (direction, color, stinger video and transition point, …) appear
