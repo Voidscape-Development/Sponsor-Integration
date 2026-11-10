@@ -141,7 +141,9 @@ Each of the four directions has its own transition, duration and options:
 
 Every direction can use **Cut**, **Fade**, **Swipe**, **Slide**, **Fade to Color** or **Stinger**, or
 **OBS scene transition** to use one of the transitions set up in the Scene Transitions dock (Move and
-other third-party transitions included). The gallery plays its own copy of a scene transition, with
+other third-party transitions included). The plugin finds the OBS frontend at runtime rather than
+linking it, so it also loads in builds of OBS without one; there, the scene transition option is
+simply not offered. The gallery plays its own copy of a scene transition, with
 the same settings, and follows any change made to them. If a chosen scene transition is renamed or
 removed, that direction falls back to a fade (with a note in the log) until one by that name exists
 again.
@@ -165,6 +167,10 @@ stop (goes out with Hide), next and previous (with the Normal transition, or Sho
 empty; a manual skip never waits out the gap). Hotkeys are available for all of those plus **Show**
 and **Hide**, which take the gallery out with its Hide transition and bring it back with its Show
 transition, keeping its place.
+
+Only **Show** brings back a gallery taken out with **Hide**. Restart, play after stop, and the source
+becoming visible again with *Restart gallery when the source becomes visible* on all move it back to
+the first image, but keep it out until it is shown.
 
 ### Automation
 

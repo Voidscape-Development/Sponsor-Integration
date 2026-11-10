@@ -26,9 +26,12 @@ extern "C" {
 
 extern struct obs_source_info picture_gallery_source_info;
 
-/* Hooks the gallery into the OBS frontend so it can use the scene transitions
- * configured there. Call once from obs_module_load / obs_module_unload. */
+/* Module-wide state for the gallery: call from obs_module_load,
+ * obs_module_post_load and obs_module_unload. Post-load hooks the gallery into
+ * the OBS frontend, when there is one, so it can use the scene transitions
+ * configured there. */
 void picture_gallery_module_load(void);
+void picture_gallery_module_post_load(void);
 void picture_gallery_module_unload(void);
 
 #ifdef __cplusplus

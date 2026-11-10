@@ -45,6 +45,11 @@ bool obs_module_load(void)
 	return true;
 }
 
+void obs_module_post_load(void)
+{
+	picture_gallery_module_post_load();
+}
+
 void obs_module_unload(void)
 {
 	picture_gallery_module_unload();

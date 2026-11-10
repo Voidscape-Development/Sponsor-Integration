@@ -4,7 +4,7 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCO
 
 project(${_name} VERSION ${_version})
 
-option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" ON)
+option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" OFF)
 option(ENABLE_QT "Use Qt functionality" OFF)
 
 include(compilerconfig)
@@ -19,9 +19,11 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
-  # lets the Picture Gallery use the scene transitions configured in OBS
-  target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_OBS_FRONTEND_API)
 endif()
+
+# The Picture Gallery finds the OBS frontend at runtime (see src/frontend-shim.h)
+# rather than linking it, so the plugin also loads where there is no frontend.
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_DL_LIBS})
 
 if(ENABLE_QT)
   find_package(Qt6 COMPONENTS Widgets Core)
@@ -40,8 +42,10 @@ target_sources(
   ${CMAKE_PROJECT_NAME}
   PRIVATE
     src/plugin-main.c
-    src/source-common.c
-    src/source-common.h
+    src/playlist-common.c
+    src/playlist-common.h
+    src/frontend-shim.c
+    src/frontend-shim.h
     src/ad-playlist-source.c
     src/ad-playlist-source.h
     src/picture-gallery-source.c
@@ -49,3 +53,4 @@ target_sources(
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+

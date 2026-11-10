@@ -38,7 +38,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * before it starts, so the new transition starts from the right picture.
  *
  * Every direction can use one of the built-in transitions or one of the scene
- * transitions configured in OBS (when built with the frontend API). A scene
+ * transitions configured in OBS (when running inside the OBS UI). A scene
  * transition is copied into a private transition of the same kind with the
  * same settings, and the copy follows that scene transition's settings when
  * they are edited.
@@ -50,14 +50,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <util/darray.h>
 #include <util/dstr.h>
 
-#include <stdlib.h>
-
-#ifdef HAVE_OBS_FRONTEND_API
-#include <obs-frontend-api.h>
-#endif
-
 #include "picture-gallery-source.h"
-#include "source-common.h"
+#include "playlist-common.h"
+#include "frontend-shim.h"
 
 #define do_log(level, format, ...) \
 	blog(level, "[picture gallery: '%s'] " format, obs_source_get_name(pg->source), ##__VA_ARGS__)
@@ -67,7 +62,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 /* clang-format off */
 
-#define S_FILES                        "files"
+#define S_FILES                        SI_S_FILES
 #define S_HOLD_TIME                    "hold_time"
 #define S_GAP_TIME                     "gap_time"
 #define S_LOOP                         "loop"
@@ -75,12 +70,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define S_HIDE_DONE                    "hide_when_done"
 #define S_RESTART_ON_SHOW              "restart_on_show"
 
-#define S_BOUNDING                     "bounding_size"
-#define S_SCALE_MODE                   "scale_mode"
-#define S_ALIGNMENT                    "alignment"
-
 #define S_GROUP_PLAYBACK               "playback_group"
-#define S_GROUP_APPEARANCE             "appearance_group"
 
 /* per-direction settings are "<direction>_<suffix>", e.g. "show_duration" */
 #define SS_TYPE                        "transition"
@@ -96,17 +86,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define SS_GROUP                       "group"
 
 #define TR_SAME                        "same"
-#define TR_CUT                         "cut"
-#define TR_FADE                        "fade"
-#define TR_SWIPE                       "swipe"
-#define TR_SLIDE                       "slide"
-#define TR_FADE_TO_COLOR               "fade_to_color"
-#define TR_STINGER                     "stinger"
 #define TR_SCENE                       "scene"
-
-#define SCALE_FIT                      "fit"
-#define SCALE_STRETCH                  "stretch"
-#define SCALE_DOWN_ONLY                "down_only"
 
 #define T_(text) obs_module_text("PictureGallery." text)
 #define T_PICTURE_GALLERY              T_("Name")
@@ -121,51 +101,14 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define T_RESTART_ON_SHOW              T_("RestartOnShow")
 
 #define T_GROUP_PLAYBACK               T_("Group.Playback")
-#define T_GROUP_APPEARANCE             T_("Group.Appearance")
 
 #define T_TR_TYPE                      T_("Transition")
 #define T_TR_SAME                      T_("Transition.Same")
-#define T_TR_CUT                       T_("Transition.Cut")
-#define T_TR_FADE                      T_("Transition.Fade")
-#define T_TR_SWIPE                     T_("Transition.Swipe")
-#define T_TR_SLIDE                     T_("Transition.Slide")
-#define T_TR_FADE_TO_COLOR             T_("Transition.FadeToColor")
-#define T_TR_STINGER                   T_("Transition.Stinger")
 #define T_TR_SCENE                     T_("Transition.Scene")
 #define T_TR_SCENE_NAME                T_("Transition.SceneName")
 #define T_TR_SCENE_NAME_DESC           T_("Transition.SceneName.Desc")
 #define T_TR_SCENE_MISSING             T_("Transition.SceneName.Missing")
 #define T_TR_DURATION                  T_("Transition.Duration")
-#define T_TR_DIRECTION                 T_("Transition.Direction")
-#define T_TR_SWIPE_IN                  T_("Transition.SwipeIn")
-#define T_TR_COLOR                     T_("Transition.Color")
-#define T_TR_SWITCH_POINT              T_("Transition.SwitchPoint")
-#define T_TR_STINGER_PATH              T_("Transition.Stinger.Path")
-#define T_TR_STINGER_POINT             T_("Transition.Stinger.TransitionPoint")
-#define T_TR_STINGER_HW                T_("Transition.Stinger.HardwareDecode")
-
-#define T_DIR_LEFT                     T_("Direction.Left")
-#define T_DIR_RIGHT                    T_("Direction.Right")
-#define T_DIR_UP                       T_("Direction.Up")
-#define T_DIR_DOWN                     T_("Direction.Down")
-
-#define T_BOUNDING                     T_("BoundingSize")
-#define T_BOUNDING_AUTO                T_("BoundingSize.Auto")
-#define T_SCALE_MODE                   T_("ScaleMode")
-#define T_SCALE_FIT                    T_("ScaleMode.Fit")
-#define T_SCALE_STRETCH                T_("ScaleMode.Stretch")
-#define T_SCALE_DOWN_ONLY              T_("ScaleMode.DownOnly")
-#define T_ALIGNMENT                    T_("Alignment")
-
-#define T_ALIGN_CENTER                 T_("Align.Center")
-#define T_ALIGN_TOP_LEFT               T_("Align.TopLeft")
-#define T_ALIGN_TOP                    T_("Align.Top")
-#define T_ALIGN_TOP_RIGHT              T_("Align.TopRight")
-#define T_ALIGN_LEFT                   T_("Align.Left")
-#define T_ALIGN_RIGHT                  T_("Align.Right")
-#define T_ALIGN_BOTTOM_LEFT            T_("Align.BottomLeft")
-#define T_ALIGN_BOTTOM                 T_("Align.Bottom")
-#define T_ALIGN_BOTTOM_RIGHT           T_("Align.BottomRight")
 
 #define T_HK_PLAY_PAUSE                T_("Hotkey.PlayPause")
 #define T_HK_RESTART                   T_("Hotkey.Restart")
@@ -177,18 +120,24 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 /* clang-format on */
 
-/* Maximum number of files pulled in from a single directory entry. */
-#define MAX_DIR_FILES 500
-
 /* Images only report their real dimensions once they have loaded, so automatic
  * sizing is refreshed on this interval (in seconds). */
 #define SIZE_UPDATE_INTERVAL 0.25f
 
 /* How long past its configured duration a transition is waited on before it
  * is taken to have finished, in seconds. A transition reports its own end, but
- * one that is never rendered (or a stinger whose video will not open) must not
- * hold the rotation up for good. */
+ * one that is never rendered must not hold the rotation up for good. */
 #define TRANSITION_GRACE 10.0f
+
+/* The same for a transition that sets its own length - a stinger, or a scene
+ * transition with a fixed duration - whose length the gallery cannot know
+ * ahead of time. Long enough for any real stinger, short enough that a broken
+ * one does not stop the gallery for good. */
+#define FIXED_TRANSITION_LIMIT 120.0f
+
+/* How many ticks the previous transition stays on screen after another one
+ * takes over without starting. See trail_previous(). */
+#define TRAIL_TICKS 2
 
 /* ------------------------------------------------------------------------- */
 
@@ -210,10 +159,30 @@ struct pg_slot_desc {
 	bool allow_same;
 };
 
+/* clang-format off */
+#define SLOT_TR_KEYS(prefix) {                              \
+		.direction = prefix "_" SS_DIRECTION,          \
+		.swipe_in = prefix "_" SS_SWIPE_IN,            \
+		.color = prefix "_" SS_COLOR,                  \
+		.switch_point = prefix "_" SS_SWITCH_POINT,    \
+		.stinger_path = prefix "_" SS_STINGER_PATH,    \
+		.stinger_point = prefix "_" SS_STINGER_POINT,  \
+		.stinger_hw = prefix "_" SS_STINGER_HW,        \
+	}
+
+/* where each direction's transition options are kept, e.g. "show_direction" */
+static const struct si_tr_keys slot_tr_keys[PG_NUM_SLOTS] = {
+	SLOT_TR_KEYS("normal"),
+	SLOT_TR_KEYS("show"),
+	SLOT_TR_KEYS("hide"),
+	SLOT_TR_KEYS("wrap"),
+};
+/* clang-format on */
+
 static const struct pg_slot_desc slot_desc[PG_NUM_SLOTS] = {
-	{"normal", "Group.Normal", "Group.Normal.Desc", TR_FADE, 500, false},
-	{"show", "Group.Show", "Group.Show.Desc", TR_FADE, 500, false},
-	{"hide", "Group.Hide", "Group.Hide.Desc", TR_FADE, 500, false},
+	{"normal", "Group.Normal", "Group.Normal.Desc", SI_TR_FADE, 500, false},
+	{"show", "Group.Show", "Group.Show.Desc", SI_TR_FADE, 500, false},
+	{"hide", "Group.Hide", "Group.Hide.Desc", SI_TR_FADE, 500, false},
 	{"wrap", "Group.Wrap", "Group.Wrap.Desc", TR_SAME, 500, true},
 };
 
@@ -242,6 +211,12 @@ struct pg_slot {
 
 	/* Set by the transition's transition_stop signal. */
 	volatile bool done;
+};
+
+/* a transition that has been replaced, and the slot it was replaced in */
+struct pg_retired {
+	obs_source_t *tr;
+	struct pg_slot *slot;
 };
 
 struct pg_item {
@@ -274,8 +249,6 @@ enum pg_after_out {
 };
 
 typedef DARRAY(struct pg_item) pg_item_array_t;
-typedef DARRAY(size_t) pg_index_array_t;
-typedef DARRAY(char *) pg_path_array_t;
 
 struct picture_gallery {
 	obs_source_t *source;
@@ -292,14 +265,25 @@ struct picture_gallery {
 	bool hide_when_done;
 	bool restart_on_show;
 
-	pg_path_array_t configured_paths;
+	si_path_array_t configured_paths;
 
 	/* ---- children ---- */
 	struct pg_slot slots[PG_NUM_SLOTS];
 	/* the slot on screen, NULL before the first image is shown */
 	struct pg_slot *cur;
+
+	/* The transition that was on screen before `cur` took over, still drawn
+	 * in its place for a couple of ticks - see trail_previous(). A
+	 * reference. `trail_retired` is the slot it was replaced in, when it no
+	 * longer belongs to one and has to be retired once the trail ends. */
+	obs_source_t *trail_tr;
+	struct pg_slot *trail_retired;
+	int trail_ticks;
+
+	/* replaced transitions waiting to be let go of outside the mutex */
+	DARRAY(struct pg_retired) retired;
 	pg_item_array_t items;
-	pg_index_array_t order;
+	si_index_array_t order;
 
 	/* ---- playback state ---- */
 	size_t order_pos;
@@ -324,23 +308,13 @@ struct picture_gallery {
 	uint32_t cy;
 	uint32_t content_cx;
 	uint32_t content_cy;
-	bool auto_size;
-	bool aspect_only;
-	uint32_t bound_cx;
-	uint32_t bound_cy;
-	enum obs_transition_scale_type scale_type;
-	uint32_t alignment;
+	struct si_layout layout;
 	float size_timer;
 
 	bool first_update_done;
 
-	obs_hotkey_id play_pause_hotkey;
-	obs_hotkey_id restart_hotkey;
-	obs_hotkey_id stop_hotkey;
-	obs_hotkey_id next_hotkey;
-	obs_hotkey_id prev_hotkey;
-	obs_hotkey_id show_hotkey;
-	obs_hotkey_id hide_hotkey;
+	/* paths handed to the missing files dialog */
+	si_missing_array_t missing_paths;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -375,16 +349,15 @@ static void st_cache_free(void)
 	da_free(st_cache);
 }
 
-#ifdef HAVE_OBS_FRONTEND_API
 /* UI thread only. */
 static void st_refresh(void)
 {
-	struct obs_frontend_source_list list = {0};
+	struct si_frontend_source_list list = {0};
 
-	if (!st_mutex_ready)
+	if (!st_mutex_ready || !si_frontend_available())
 		return;
 
-	obs_frontend_get_transitions(&list);
+	si_frontend_get_transitions(&list);
 
 	pthread_mutex_lock(&st_mutex);
 	st_cache_free();
@@ -404,9 +377,8 @@ static void st_refresh(void)
 
 	pthread_mutex_unlock(&st_mutex);
 
-	obs_frontend_source_list_free(&list);
+	si_frontend_source_list_free(&list);
 }
-#endif
 
 /* A strong reference to the scene transition called `name`, or NULL. */
 static obs_source_t *st_find(const char *name)
@@ -456,7 +428,6 @@ static void st_register(struct picture_gallery *pg, bool add)
 	pthread_mutex_unlock(&st_mutex);
 }
 
-#ifdef HAVE_OBS_FRONTEND_API
 /* Runs every gallery's update() again so it picks its scene transitions up
  * afresh - they may have been created, renamed or removed. */
 static void st_update_galleries(void)
@@ -482,18 +453,19 @@ static void st_update_galleries(void)
 	da_free(sources);
 }
 
-static void st_frontend_event(enum obs_frontend_event event, void *unused)
+static void st_frontend_event(int event, void *unused)
 {
 	UNUSED_PARAMETER(unused);
 
 	switch (event) {
-	case OBS_FRONTEND_EVENT_FINISHED_LOADING:
-	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED:
-	case OBS_FRONTEND_EVENT_TRANSITION_LIST_CHANGED:
+	case SI_FRONTEND_EVENT_FINISHED_LOADING:
+	case SI_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED:
+	case SI_FRONTEND_EVENT_TRANSITION_LIST_CHANGED:
 		st_refresh();
 		st_update_galleries();
 		break;
-	case OBS_FRONTEND_EVENT_EXIT:
+	case SI_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP:
+	case SI_FRONTEND_EVENT_EXIT:
 		if (st_mutex_ready) {
 			pthread_mutex_lock(&st_mutex);
 			st_cache_free();
@@ -504,7 +476,8 @@ static void st_frontend_event(enum obs_frontend_event event, void *unused)
 		break;
 	}
 }
-#endif
+
+static bool st_listening = false;
 
 void picture_gallery_module_load(void)
 {
@@ -515,10 +488,14 @@ void picture_gallery_module_load(void)
 	da_init(st_cache);
 	da_init(st_galleries);
 	st_mutex_ready = true;
+}
 
-#ifdef HAVE_OBS_FRONTEND_API
-	obs_frontend_add_event_callback(st_frontend_event, NULL);
-#endif
+void picture_gallery_module_post_load(void)
+{
+	/* Post-load rather than load: by now the OBS UI has set the frontend
+	 * up, and anywhere without one this quietly finds nothing. */
+	if (st_mutex_ready && si_frontend_load())
+		st_listening = si_frontend_add_event_callback(st_frontend_event, NULL);
 }
 
 void picture_gallery_module_unload(void)
@@ -526,9 +503,10 @@ void picture_gallery_module_unload(void)
 	if (!st_mutex_ready)
 		return;
 
-#ifdef HAVE_OBS_FRONTEND_API
-	obs_frontend_remove_event_callback(st_frontend_event, NULL);
-#endif
+	if (st_listening) {
+		si_frontend_remove_event_callback(st_frontend_event, NULL);
+		st_listening = false;
+	}
 
 	pthread_mutex_lock(&st_mutex);
 	st_cache_free();
@@ -553,12 +531,15 @@ static inline void set_media_state(struct picture_gallery *pg, enum obs_media_st
 	pg->state = state;
 }
 
+/* The transition being drawn: the current one, or the one trailing it. */
 static obs_source_t *get_current_transition(struct picture_gallery *pg)
 {
 	obs_source_t *tr = NULL;
 
 	pthread_mutex_lock(&pg->mutex);
-	if (pg->cur)
+	if (pg->trail_tr)
+		tr = obs_source_get_ref(pg->trail_tr);
+	else if (pg->cur)
 		tr = obs_source_get_ref(pg->cur->tr);
 	pthread_mutex_unlock(&pg->mutex);
 
@@ -573,14 +554,6 @@ static void free_items(pg_item_array_t *items)
 	}
 
 	da_free(*items);
-}
-
-static void free_paths(pg_path_array_t *paths)
-{
-	for (size_t i = 0; i < paths->num; i++)
-		bfree(paths->array[i]);
-
-	da_free(*paths);
 }
 
 static obs_source_t *find_existing_source(pg_item_array_t *items, const char *path)
@@ -632,102 +605,17 @@ static void add_item(struct picture_gallery *pg, pg_item_array_t *new_items, con
 	da_push_back(*new_items, &item);
 }
 
-static int compare_paths(const void *a, const void *b)
-{
-	return astrcmpi(*(const char *const *)a, *(const char *const *)b);
-}
-
-/* Adds every image in `path`. Returns false if it is not a directory. */
-static bool add_directory(struct picture_gallery *pg, pg_item_array_t *new_items, const char *path)
-{
-	DARRAY(char *) entries;
-	struct dstr file_path = {0};
-	os_dir_t *dir = os_opendir(path);
-
-	if (!dir)
-		return false;
-
-	da_init(entries);
-
-	for (;;) {
-		struct os_dirent *ent = os_readdir(dir);
-		char *entry;
-
-		if (!ent)
-			break;
-		if (ent->directory)
-			continue;
-		if (!si_is_image_extension(os_get_path_extension(ent->d_name)))
-			continue;
-
-		entry = bstrdup(ent->d_name);
-		da_push_back(entries, &entry);
-
-		if (entries.num >= MAX_DIR_FILES) {
-			warn("directory '%s' holds more than %d images, ignoring the rest", path, MAX_DIR_FILES);
-			break;
-		}
-	}
-
-	os_closedir(dir);
-
-	/* directory order is filesystem dependent - sort so the gallery plays
-	 * in the same order on every machine and every launch */
-	if (entries.num > 1)
-		qsort(entries.array, entries.num, sizeof(char *), compare_paths);
-
-	for (size_t i = 0; i < entries.num; i++) {
-		dstr_copy(&file_path, path);
-		dstr_cat_ch(&file_path, '/');
-		dstr_cat(&file_path, entries.array[i]);
-		add_item(pg, new_items, file_path.array);
-		bfree(entries.array[i]);
-	}
-
-	dstr_free(&file_path);
-	da_free(entries);
-
-	return true;
-}
-
 /* ------------------------------------------------------------------------- */
 /* running order                                                              */
 
 static void build_order(struct picture_gallery *pg)
 {
-	size_t count = pg->items.num;
-
-	da_resize(pg->order, count);
-
-	for (size_t i = 0; i < count; i++)
-		pg->order.array[i] = i;
-
-	if (!pg->shuffle || count < 2)
-		return;
-
-	/* Fisher-Yates, so every image comes up exactly once per pass */
-	for (size_t i = count - 1; i > 0; i--) {
-		size_t j = (size_t)(rand() % (int)(i + 1));
-		size_t tmp = pg->order.array[i];
-
-		pg->order.array[i] = pg->order.array[j];
-		pg->order.array[j] = tmp;
-	}
+	si_order_build(&pg->order, pg->items.num, pg->shuffle);
 }
 
-/* Reshuffle for the next pass without repeating an image across the loop. */
 static void reshuffle_order(struct picture_gallery *pg)
 {
-	size_t last = pg->order.num ? pg->order.array[pg->order.num - 1] : 0;
-
-	build_order(pg);
-
-	if (pg->order.num > 1 && pg->order.array[0] == last) {
-		size_t tmp = pg->order.array[0];
-
-		pg->order.array[0] = pg->order.array[pg->order.num - 1];
-		pg->order.array[pg->order.num - 1] = tmp;
-	}
+	si_order_reshuffle(&pg->order, pg->items.num, pg->shuffle);
 }
 
 static inline bool item_valid(struct picture_gallery *pg)
@@ -791,6 +679,64 @@ static struct pg_slot *resolve_slot(struct picture_gallery *pg, enum pg_slot_id 
 }
 
 /*
+ * Keeping the picture steady while the transition on screen changes.
+ *
+ * A transition works out where to draw what it holds when it ticks or when a
+ * transition starts - never when it is simply handed a picture with
+ * obs_transition_set(). A transition that is brand new (a settings change made
+ * while it is on screen), or that has not held a picture before, has nothing
+ * worked out yet, and one created during this source's tick is not ticked by
+ * libobs until the frame after. Drawn straight away, it would draw nothing: a
+ * one-frame flicker on stream.
+ *
+ * So when the transition on screen changes, the previous one - which still
+ * holds the same picture, laid out - goes on being drawn for TRAIL_TICKS more
+ * ticks, by which point libobs has ticked the new one. A transition that is
+ * started rather than handed its picture is laid out by the start, and ends
+ * the trail at once.
+ */
+
+/* Ends the trail. Mutex must be held. A transition that was replaced is
+ * queued to be retired by flush_retired() once the mutex is let go of. */
+static void end_trail(struct picture_gallery *pg)
+{
+	obs_source_t *tr = pg->trail_tr;
+	struct pg_slot *retired = pg->trail_retired;
+
+	if (!tr)
+		return;
+
+	pg->trail_tr = NULL;
+	pg->trail_retired = NULL;
+	pg->trail_ticks = 0;
+
+	if (retired) {
+		struct pg_retired entry = {tr, retired};
+
+		da_push_back(pg->retired, &entry);
+		return;
+	}
+
+	/* still a slot's own transition: it lets go of the picture, unless it
+	 * has meanwhile gone back on screen */
+	if (!pg->cur || pg->cur->tr != tr)
+		obs_transition_clear(tr);
+
+	obs_source_release(tr);
+}
+
+/* Keeps `tr` (a reference, which this takes over) on screen for a couple of
+ * ticks while the transition replacing it gets laid out. Mutex must be held. */
+static void trail_previous(struct picture_gallery *pg, obs_source_t *tr, struct pg_slot *retired_from)
+{
+	end_trail(pg);
+
+	pg->trail_tr = tr;
+	pg->trail_retired = retired_from;
+	pg->trail_ticks = TRAIL_TICKS;
+}
+
+/*
  * Make `slot` the one on screen. Whatever the current slot shows is handed to
  * the new one first, so its transition starts from the right picture, and the
  * old one lets go of it. Mutex must be held.
@@ -802,13 +748,12 @@ static void switch_to_slot(struct picture_gallery *pg, struct pg_slot *slot)
 	if (pg->cur == slot)
 		return;
 
-	if (pg->cur && pg->cur->tr)
+	if (pg->cur && pg->cur->tr) {
 		showing = obs_transition_get_active_source(pg->cur->tr);
+		trail_previous(pg, obs_source_get_ref(pg->cur->tr), NULL);
+	}
 
 	obs_transition_set(slot->tr, showing);
-
-	if (pg->cur && pg->cur->tr)
-		obs_transition_clear(pg->cur->tr);
 
 	obs_source_release(showing);
 	pg->cur = slot;
@@ -832,10 +777,13 @@ static void run_transition(struct picture_gallery *pg, enum pg_slot_id id, obs_s
 	if (slot->cut) {
 		obs_transition_set(slot->tr, dest);
 		os_atomic_set_bool(&slot->done, true);
-	} else if (!obs_transition_start(slot->tr, OBS_TRANSITION_MODE_AUTO, slot->duration_ms, dest)) {
+	} else if (obs_transition_start(slot->tr, OBS_TRANSITION_MODE_AUTO, slot->duration_ms, dest)) {
+		/* starting lays the transition out: nothing to wait for */
+		end_trail(pg);
+	} else {
 		/* libobs refuses a transition to whatever is already on screen
 		 * (a single image gallery, the same file listed twice in a
-		 * row, nothing to nothing) - swap it in directly */
+		 * row, nothing to nothing) - it is already there */
 		obs_transition_set(slot->tr, dest);
 		os_atomic_set_bool(&slot->done, true);
 	}
@@ -852,7 +800,13 @@ static bool transition_done(struct picture_gallery *pg)
 	if (!slot || !slot->tr || os_atomic_load_bool(&slot->done))
 		return true;
 
-	limit = (float)slot->duration_ms / 1000.0f + TRANSITION_GRACE;
+	/* A stinger runs for as long as its video does, whatever the duration
+	 * setting says; going by the setting would start the hold time while
+	 * the stinger was still playing. */
+	if (obs_transition_fixed(slot->tr))
+		limit = FIXED_TRANSITION_LIMIT;
+	else
+		limit = (float)slot->duration_ms / 1000.0f + TRANSITION_GRACE;
 	if (pg->elapsed >= limit) {
 		warn("the %s transition did not report its end after %.1f seconds, moving on",
 		     slot_desc[slot->id].prefix, limit);
@@ -874,8 +828,7 @@ static void transition_stopped(void *data, calldata_t *cd)
 /* Applies the gallery's sizing to one of its transitions. */
 static void apply_transition_layout(struct picture_gallery *pg, obs_source_t *tr)
 {
-	obs_transition_set_alignment(tr, pg->alignment);
-	obs_transition_set_scale_type(tr, pg->scale_type);
+	si_layout_apply(&pg->layout, tr);
 
 	if (pg->cx && pg->cy)
 		obs_transition_set_size(tr, pg->cx, pg->cy);
@@ -947,6 +900,8 @@ static void take_out(struct picture_gallery *pg, enum pg_after_out after)
  * held. */
 static void clear_now(struct picture_gallery *pg)
 {
+	end_trail(pg);
+
 	if (pg->cur && pg->cur->tr) {
 		obs_transition_set(pg->cur->tr, NULL);
 		os_atomic_set_bool(&pg->cur->done, true);
@@ -1037,7 +992,14 @@ static void skip(struct picture_gallery *pg, bool forward)
 	bring_in_from_anywhere(pg);
 }
 
-/* Start over from the first image. Mutex must be held. */
+/*
+ * Start over from the first image. A gallery taken out with the Hide control
+ * stays out: only the Show control brings it back, so a restart - pressing
+ * play, the restart button, or the source becoming visible with "restart when
+ * visible" on - moves it back to the start without revealing it.
+ *
+ * Mutex must be held.
+ */
 static void restart_gallery(struct picture_gallery *pg)
 {
 	if (pg->shuffle)
@@ -1047,7 +1009,6 @@ static void restart_gallery(struct picture_gallery *pg)
 	pg->finished = false;
 	pg->stopped = false;
 	pg->paused = false;
-	pg->user_hidden = false;
 
 	if (!pg->items.num) {
 		set_media_state(pg, OBS_MEDIA_STATE_NONE);
@@ -1058,7 +1019,7 @@ static void restart_gallery(struct picture_gallery *pg)
 	set_media_state(pg, OBS_MEDIA_STATE_PLAYING);
 	obs_source_media_started(pg->source);
 
-	if (pg->showing)
+	if (pg->showing && !pg->user_hidden)
 		bring_in_from_anywhere(pg);
 	else
 		enter_phase(pg, PG_IDLE);
@@ -1108,24 +1069,7 @@ static void update_size(struct picture_gallery *pg)
 	pg->content_cx = cx;
 	pg->content_cy = cy;
 
-	if (!pg->auto_size) {
-		if (pg->aspect_only) {
-			if (cx && cy) {
-				double cx_f = (double)cx;
-				double cy_f = (double)cy;
-				double old_aspect = cx_f / cy_f;
-				double new_aspect = (double)pg->bound_cx / (double)pg->bound_cy;
-
-				if (new_aspect > old_aspect)
-					cx = (uint32_t)(cy_f * new_aspect);
-				else
-					cy = (uint32_t)(cx_f / new_aspect);
-			}
-		} else {
-			cx = pg->bound_cx;
-			cy = pg->bound_cy;
-		}
-	}
+	si_layout_size(&pg->layout, cx, cy, &cx, &cy);
 
 	if (cx == pg->cx && cy == pg->cy)
 		return;
@@ -1139,82 +1083,8 @@ static void update_size(struct picture_gallery *pg)
 	}
 }
 
-/* "1920x1080" is a fixed size, "16:9" is a fixed aspect ratio, and anything
- * else - including the localized "Automatic" entry - means automatic. */
-static void parse_bounding_size(struct picture_gallery *pg, const char *val)
-{
-	int cx = 0;
-	int cy = 0;
-
-	pg->auto_size = true;
-	pg->aspect_only = false;
-
-	if (!val || !*val)
-		return;
-
-	if (sscanf(val, "%dx%d", &cx, &cy) == 2 && cx > 0 && cy > 0) {
-		pg->auto_size = false;
-	} else if (sscanf(val, "%d:%d", &cx, &cy) == 2 && cx > 0 && cy > 0) {
-		pg->auto_size = false;
-		pg->aspect_only = true;
-	} else {
-		return;
-	}
-
-	pg->bound_cx = (uint32_t)cx;
-	pg->bound_cy = (uint32_t)cy;
-}
-
 /* ------------------------------------------------------------------------- */
 /* settings                                                                   */
-
-static const char *builtin_transition_id(const char *type, bool *is_cut)
-{
-	*is_cut = false;
-
-	if (astrcmpi(type, TR_CUT) == 0) {
-		*is_cut = true;
-		return "cut_transition";
-	}
-	if (astrcmpi(type, TR_SWIPE) == 0)
-		return "swipe_transition";
-	if (astrcmpi(type, TR_SLIDE) == 0)
-		return "slide_transition";
-	if (astrcmpi(type, TR_FADE_TO_COLOR) == 0)
-		return "fade_to_color_transition";
-	if (astrcmpi(type, TR_STINGER) == 0)
-		return "obs_stinger_transition";
-
-	return "fade_transition";
-}
-
-static obs_data_t *builtin_transition_settings(const char *tr_id, enum pg_slot_id id, obs_data_t *settings)
-{
-	obs_data_t *tr_settings = obs_data_create();
-	char key[64];
-
-	if (strcmp(tr_id, "swipe_transition") == 0 || strcmp(tr_id, "slide_transition") == 0) {
-		obs_data_set_string(tr_settings, "direction",
-				    obs_data_get_string(settings, slot_key(key, sizeof(key), id, SS_DIRECTION)));
-		obs_data_set_bool(tr_settings, "swipe_in",
-				  obs_data_get_bool(settings, slot_key(key, sizeof(key), id, SS_SWIPE_IN)));
-	} else if (strcmp(tr_id, "fade_to_color_transition") == 0) {
-		obs_data_set_int(tr_settings, "color",
-				 obs_data_get_int(settings, slot_key(key, sizeof(key), id, SS_COLOR)));
-		obs_data_set_int(tr_settings, "switch_point",
-				 obs_data_get_int(settings, slot_key(key, sizeof(key), id, SS_SWITCH_POINT)));
-	} else if (strcmp(tr_id, "obs_stinger_transition") == 0) {
-		obs_data_set_string(tr_settings, "path",
-				    obs_data_get_string(settings, slot_key(key, sizeof(key), id, SS_STINGER_PATH)));
-		obs_data_set_int(tr_settings, "tp_type", 0 /* transition point in milliseconds */);
-		obs_data_set_int(tr_settings, "transition_point",
-				 obs_data_get_int(settings, slot_key(key, sizeof(key), id, SS_STINGER_POINT)));
-		obs_data_set_bool(tr_settings, "hw_decode",
-				  obs_data_get_bool(settings, slot_key(key, sizeof(key), id, SS_STINGER_HW)));
-	}
-
-	return tr_settings;
-}
 
 /* Follows edits made to a scene transition into the private copy of it. */
 static void scene_transition_updated(void *data, calldata_t *cd)
@@ -1243,13 +1113,15 @@ static void scene_transition_updated(void *data, calldata_t *cd)
 
 static void watch_scene_transition(struct pg_slot *slot, obs_source_t *scene)
 {
-	obs_source_t *old = obs_weak_source_get_source(slot->scene);
+	obs_source_t *old;
 
-	if (old == scene) {
-		obs_source_release(old);
+	/* still watching the same one */
+	if (slot->scene && scene && obs_weak_source_references_source(slot->scene, scene))
 		return;
-	}
 
+	/* Whatever was watched before is let go of - including when it has
+	 * been deleted since and can no longer be reached. */
+	old = obs_weak_source_get_source(slot->scene);
 	if (old) {
 		signal_handler_disconnect(obs_source_get_signal_handler(old), "update", scene_transition_updated, slot);
 		obs_source_release(old);
@@ -1281,6 +1153,22 @@ static void retire_transition(struct picture_gallery *pg, struct pg_slot *slot, 
 	obs_source_release(tr);
 }
 
+/* Retires the transitions end_trail() queued. No lock may be held. */
+static void flush_retired(struct picture_gallery *pg)
+{
+	DARRAY(struct pg_retired) retired;
+
+	pthread_mutex_lock(&pg->mutex);
+	retired.da = pg->retired.da;
+	da_init(pg->retired);
+	pthread_mutex_unlock(&pg->mutex);
+
+	for (size_t i = 0; i < retired.num; i++)
+		retire_transition(pg, retired.array[i].slot, retired.array[i].tr, false);
+
+	da_free(retired);
+}
+
 /*
  * Brings one direction's transition in line with the settings: picks the kind
  * of transition, creates a fresh one when the kind changed, and hands it its
@@ -1308,12 +1196,23 @@ static void update_slot(struct picture_gallery *pg, struct pg_slot *slot, obs_da
 		pthread_mutex_lock(&pg->mutex);
 		slot->use_normal = true;
 		if (slot->tr) {
-			if (pg->cur == slot && pg->slots[PG_SLOT_NORMAL].tr)
-				switch_to_slot(pg, &pg->slots[PG_SLOT_NORMAL]);
-			else if (pg->cur == slot)
-				pg->cur = NULL;
-
 			old_tr = slot->tr;
+
+			if (pg->cur == slot && pg->slots[PG_SLOT_NORMAL].tr) {
+				/* The normal transition takes the picture over and
+				 * this one trails it. The trail holds a reference of
+				 * its own; it takes over the slot's instead and
+				 * retires the transition when it ends. */
+				switch_to_slot(pg, &pg->slots[PG_SLOT_NORMAL]);
+				if (pg->trail_tr == old_tr) {
+					obs_source_release(pg->trail_tr);
+					pg->trail_retired = slot;
+					old_tr = NULL;
+				}
+			} else if (pg->cur == slot) {
+				pg->cur = NULL;
+			}
+
 			slot->tr = NULL;
 		}
 		pthread_mutex_unlock(&pg->mutex);
@@ -1352,8 +1251,10 @@ static void update_slot(struct picture_gallery *pg, struct pg_slot *slot, obs_da
 			tr_settings = obs_data_create();
 		}
 	} else {
-		tr_id = builtin_transition_id(type, &is_cut);
-		tr_settings = builtin_transition_settings(tr_id, id, settings);
+		bool is_stinger;
+
+		tr_id = si_transition_id(type, &is_cut, &is_stinger);
+		tr_settings = si_transition_settings(tr_id, &slot_tr_keys[id], settings);
 		dstr_printf(&sig, "builtin|");
 	}
 
@@ -1389,13 +1290,17 @@ static void update_slot(struct picture_gallery *pg, struct pg_slot *slot, obs_da
 	if (new_tr) {
 		old_tr = slot->tr;
 
-		/* the slot on screen keeps its picture across the swap */
+		/* the slot on screen keeps its picture across the swap, and the
+		 * old transition stays up until the new one is laid out */
 		if (pg->cur == slot && old_tr) {
 			obs_source_t *showing = obs_transition_get_active_source(old_tr);
 
 			obs_transition_set(new_tr, showing);
 			obs_source_release(showing);
 			os_atomic_set_bool(&slot->done, true);
+
+			trail_previous(pg, old_tr, slot);
+			old_tr = NULL;
 		}
 
 		slot->tr = new_tr;
@@ -1421,46 +1326,20 @@ static void update_slot(struct picture_gallery *pg, struct pg_slot *slot, obs_da
 	obs_source_release(scene);
 }
 
-static void read_configured_paths(obs_data_t *settings, pg_path_array_t *paths)
-{
-	obs_data_array_t *array = obs_data_get_array(settings, S_FILES);
-	size_t count = obs_data_array_count(array);
-
-	for (size_t i = 0; i < count; i++) {
-		obs_data_t *item = obs_data_array_item(array, i);
-		const char *path = obs_data_get_string(item, "value");
-
-		if (path && *path) {
-			char *copy = bstrdup(path);
-			da_push_back(*paths, &copy);
-		}
-
-		obs_data_release(item);
-	}
-
-	obs_data_array_release(array);
-}
-
-static bool paths_equal(const pg_path_array_t *a, const pg_path_array_t *b)
-{
-	if (a->num != b->num)
-		return false;
-
-	for (size_t i = 0; i < a->num; i++) {
-		if (strcmp(a->array[i], b->array[i]) != 0)
-			return false;
-	}
-
-	return true;
-}
-
+/*
+ * libobs never runs this on the caller's thread for a video source:
+ * obs_source_update() only merges the settings and counts the update, and the
+ * update itself runs on the graphics thread's next tick. Updates are therefore
+ * serialized with each other and with video_tick(); only the mutex shared with
+ * the audio, render and proc callbacks is needed.
+ */
 static void pg_update(void *data, obs_data_t *settings)
 {
 	struct picture_gallery *pg = data;
 	pg_item_array_t new_items;
 	pg_item_array_t old_items;
-	pg_path_array_t paths;
-	const char *scale_mode;
+	si_path_array_t paths;
+	si_path_array_t files;
 	bool first_update = !pg->first_update_done;
 	bool shuffle = obs_data_get_bool(settings, S_SHUFFLE);
 	bool reload_items;
@@ -1469,6 +1348,7 @@ static void pg_update(void *data, obs_data_t *settings)
 	da_init(new_items);
 	da_init(old_items);
 	da_init(paths);
+	da_init(files);
 
 	/* ---- plain settings ---- */
 
@@ -1483,17 +1363,7 @@ static void pg_update(void *data, obs_data_t *settings)
 	pg->hide_when_done = obs_data_get_bool(settings, S_HIDE_DONE);
 	pg->restart_on_show = obs_data_get_bool(settings, S_RESTART_ON_SHOW);
 
-	parse_bounding_size(pg, obs_data_get_string(settings, S_BOUNDING));
-
-	scale_mode = obs_data_get_string(settings, S_SCALE_MODE);
-	if (astrcmpi(scale_mode, SCALE_STRETCH) == 0)
-		pg->scale_type = OBS_TRANSITION_SCALE_STRETCH;
-	else if (astrcmpi(scale_mode, SCALE_DOWN_ONLY) == 0)
-		pg->scale_type = OBS_TRANSITION_SCALE_MAX_ONLY;
-	else
-		pg->scale_type = OBS_TRANSITION_SCALE_ASPECT;
-
-	pg->alignment = si_alignment_from_string(obs_data_get_string(settings, S_ALIGNMENT));
+	si_layout_read(&pg->layout, settings);
 
 	pthread_mutex_unlock(&pg->mutex);
 
@@ -1507,19 +1377,20 @@ static void pg_update(void *data, obs_data_t *settings)
 	/* Expanding directories walks the filesystem, so the images are only
 	 * rebuilt when the list itself changed - not for every step of a
 	 * slider drag elsewhere in the properties. */
-	read_configured_paths(settings, &paths);
-	reload_items = first_update || !paths_equal(&paths, &pg->configured_paths);
+	si_paths_read(settings, S_FILES, &paths);
+	reload_items = first_update || !si_paths_equal(&paths, &pg->configured_paths);
 
 	if (reload_items) {
-		for (size_t i = 0; i < paths.num; i++) {
-			if (!add_directory(pg, &new_items, paths.array[i]))
-				add_item(pg, &new_items, paths.array[i]);
-		}
+		si_paths_expand(&paths, si_is_image_extension, obs_source_get_name(pg->source), &files);
 
-		free_paths(&pg->configured_paths);
+		for (size_t i = 0; i < files.num; i++)
+			add_item(pg, &new_items, files.array[i]);
+
+		si_paths_free(&files);
+		si_paths_free(&pg->configured_paths);
 		pg->configured_paths = paths;
 	} else {
-		free_paths(&paths);
+		si_paths_free(&paths);
 	}
 
 	/* ---- swap in ---- */
@@ -1572,6 +1443,7 @@ static void pg_update(void *data, obs_data_t *settings)
 	pthread_mutex_unlock(&pg->mutex);
 
 	free_items(&old_items);
+	flush_retired(pg);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1731,61 +1603,6 @@ static void hide_gallery(struct picture_gallery *pg)
 /* ------------------------------------------------------------------------- */
 /* hotkeys                                                                    */
 
-static void play_pause_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
-{
-	struct picture_gallery *pg = data;
-
-	UNUSED_PARAMETER(id);
-	UNUSED_PARAMETER(hotkey);
-
-	if (pressed && obs_source_showing(pg->source))
-		obs_source_media_play_pause(pg->source, !pg->paused);
-}
-
-static void restart_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
-{
-	struct picture_gallery *pg = data;
-
-	UNUSED_PARAMETER(id);
-	UNUSED_PARAMETER(hotkey);
-
-	if (pressed && obs_source_showing(pg->source))
-		obs_source_media_restart(pg->source);
-}
-
-static void stop_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
-{
-	struct picture_gallery *pg = data;
-
-	UNUSED_PARAMETER(id);
-	UNUSED_PARAMETER(hotkey);
-
-	if (pressed && obs_source_showing(pg->source))
-		obs_source_media_stop(pg->source);
-}
-
-static void next_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
-{
-	struct picture_gallery *pg = data;
-
-	UNUSED_PARAMETER(id);
-	UNUSED_PARAMETER(hotkey);
-
-	if (pressed && obs_source_showing(pg->source))
-		obs_source_media_next(pg->source);
-}
-
-static void previous_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
-{
-	struct picture_gallery *pg = data;
-
-	UNUSED_PARAMETER(id);
-	UNUSED_PARAMETER(hotkey);
-
-	if (pressed && obs_source_showing(pg->source))
-		obs_source_media_previous(pg->source);
-}
-
 static void show_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
 {
 	UNUSED_PARAMETER(id);
@@ -1872,6 +1689,19 @@ static void pg_destroy(void *data)
 
 	st_register(pg, false);
 
+	/* the trail and anything waiting to be retired go first: they may
+	 * belong to the slots below */
+	if (pg->trail_tr) {
+		if (pg->trail_retired)
+			retire_transition(pg, pg->trail_retired, pg->trail_tr, true);
+		else
+			obs_source_release(pg->trail_tr);
+		pg->trail_tr = NULL;
+	}
+	for (size_t i = 0; i < pg->retired.num; i++)
+		retire_transition(pg, pg->retired.array[i].slot, pg->retired.array[i].tr, true);
+	da_free(pg->retired);
+
 	for (size_t i = 0; i < PG_NUM_SLOTS; i++) {
 		struct pg_slot *slot = &pg->slots[i];
 
@@ -1884,7 +1714,8 @@ static void pg_destroy(void *data)
 
 	free_items(&pg->items);
 	da_free(pg->order);
-	free_paths(&pg->configured_paths);
+	si_paths_free(&pg->configured_paths);
+	si_missing_free(&pg->missing_paths);
 
 	pthread_mutex_destroy(&pg->mutex);
 	bfree(pg);
@@ -1899,9 +1730,7 @@ static void *pg_create(obs_data_t *settings, obs_source_t *source)
 	pg->source = source;
 	pg->state = OBS_MEDIA_STATE_NONE;
 	pg->phase = PG_IDLE;
-	pg->scale_type = OBS_TRANSITION_SCALE_ASPECT;
-	pg->alignment = OBS_ALIGN_CENTER;
-	pg->auto_size = true;
+	si_layout_init(&pg->layout);
 
 	for (size_t i = 0; i < PG_NUM_SLOTS; i++) {
 		pg->slots[i].pg = pg;
@@ -1912,6 +1741,8 @@ static void *pg_create(obs_data_t *settings, obs_source_t *source)
 	da_init(pg->items);
 	da_init(pg->order);
 	da_init(pg->configured_paths);
+	da_init(pg->missing_paths);
+	da_init(pg->retired);
 
 	pthread_mutex_init_value(&pg->mutex);
 	if (pthread_mutex_init_recursive(&pg->mutex) != 0) {
@@ -1919,16 +1750,13 @@ static void *pg_create(obs_data_t *settings, obs_source_t *source)
 		return NULL;
 	}
 
-	pg->play_pause_hotkey =
-		obs_hotkey_register_source(source, "PictureGallery.PlayPause", T_HK_PLAY_PAUSE, play_pause_hotkey, pg);
-	pg->restart_hotkey =
-		obs_hotkey_register_source(source, "PictureGallery.Restart", T_HK_RESTART, restart_hotkey, pg);
-	pg->stop_hotkey = obs_hotkey_register_source(source, "PictureGallery.Stop", T_HK_STOP, stop_hotkey, pg);
-	pg->next_hotkey = obs_hotkey_register_source(source, "PictureGallery.Next", T_HK_NEXT, next_hotkey, pg);
-	pg->prev_hotkey =
-		obs_hotkey_register_source(source, "PictureGallery.Previous", T_HK_PREVIOUS, previous_hotkey, pg);
-	pg->show_hotkey = obs_hotkey_register_source(source, "PictureGallery.Show", T_HK_SHOW, show_hotkey, pg);
-	pg->hide_hotkey = obs_hotkey_register_source(source, "PictureGallery.Hide", T_HK_HIDE, hide_hotkey, pg);
+	si_media_hotkeys_register(
+		source,
+		&(struct si_hotkey_names){"PictureGallery.PlayPause", "PictureGallery.Restart", "PictureGallery.Stop",
+					  "PictureGallery.Next", "PictureGallery.Previous"},
+		&(struct si_hotkey_names){T_HK_PLAY_PAUSE, T_HK_RESTART, T_HK_STOP, T_HK_NEXT, T_HK_PREVIOUS});
+	obs_hotkey_register_source(source, "PictureGallery.Show", T_HK_SHOW, show_hotkey, pg);
+	obs_hotkey_register_source(source, "PictureGallery.Hide", T_HK_HIDE, hide_hotkey, pg);
 
 	proc_handler_add(ph, "void current_index(out int current_index)", current_index_proc, pg);
 	proc_handler_add(ph, "void current_path(out string current_path)", current_path_proc, pg);
@@ -1966,6 +1794,9 @@ static void pg_video_tick(void *data, float seconds)
 	struct picture_gallery *pg = data;
 
 	pthread_mutex_lock(&pg->mutex);
+
+	if (pg->trail_tr && --pg->trail_ticks <= 0)
+		end_trail(pg);
 
 	pg->size_timer += seconds;
 	if (pg->size_timer >= SIZE_UPDATE_INTERVAL) {
@@ -2020,6 +1851,8 @@ static void pg_video_tick(void *data, float seconds)
 
 finish:
 	pthread_mutex_unlock(&pg->mutex);
+
+	flush_retired(pg);
 }
 
 static void pg_enum_sources(void *data, obs_source_enum_proc_t cb, void *param)
@@ -2034,6 +1867,12 @@ static void pg_enum_sources(void *data, obs_source_enum_proc_t cb, void *param)
 		if (pg->slots[i].tr)
 			cb(pg->source, pg->slots[i].tr, param);
 	}
+
+	/* a replaced transition still trailing is a child until it is retired */
+	if (pg->trail_tr && pg->trail_retired)
+		cb(pg->source, pg->trail_tr, param);
+	for (size_t i = 0; i < pg->retired.num; i++)
+		cb(pg->source, pg->retired.array[i].tr, param);
 	pthread_mutex_unlock(&pg->mutex);
 }
 
@@ -2137,17 +1976,10 @@ static void pg_defaults(obs_data_t *settings)
 					    slot_desc[i].default_type);
 		obs_data_set_default_int(settings, slot_key(key, sizeof(key), id, SS_DURATION),
 					 slot_desc[i].default_duration);
-		obs_data_set_default_string(settings, slot_key(key, sizeof(key), id, SS_DIRECTION), "left");
-		obs_data_set_default_bool(settings, slot_key(key, sizeof(key), id, SS_SWIPE_IN), false);
-		obs_data_set_default_int(settings, slot_key(key, sizeof(key), id, SS_COLOR), 0xFF000000);
-		obs_data_set_default_int(settings, slot_key(key, sizeof(key), id, SS_SWITCH_POINT), 50);
-		obs_data_set_default_int(settings, slot_key(key, sizeof(key), id, SS_STINGER_POINT), 1000);
-		obs_data_set_default_bool(settings, slot_key(key, sizeof(key), id, SS_STINGER_HW), true);
+		si_transition_defaults(settings, &slot_tr_keys[i]);
 	}
 
-	obs_data_set_default_string(settings, S_BOUNDING, T_BOUNDING_AUTO);
-	obs_data_set_default_string(settings, S_SCALE_MODE, SCALE_FIT);
-	obs_data_set_default_string(settings, S_ALIGNMENT, "center");
+	si_layout_defaults(settings);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2170,23 +2002,14 @@ static bool slot_type_changed(void *priv, obs_properties_t *props, obs_property_
 	const char *type = obs_data_get_string(settings, slot_key(key, sizeof(key), id, SS_TYPE));
 	bool same = desc->allow_same && (!*type || astrcmpi(type, TR_SAME) == 0);
 	bool scene = astrcmpi(type, TR_SCENE) == 0;
-	bool is_cut = !same && astrcmpi(type, TR_CUT) == 0;
-	bool is_swipe = !same && astrcmpi(type, TR_SWIPE) == 0;
-	bool is_slide = !same && astrcmpi(type, TR_SLIDE) == 0;
-	bool is_stinger = !same && astrcmpi(type, TR_STINGER) == 0;
-	bool to_color = !same && astrcmpi(type, TR_FADE_TO_COLOR) == 0;
+	bool is_cut = !same && astrcmpi(type, SI_TR_CUT) == 0;
+	bool is_stinger = !same && astrcmpi(type, SI_TR_STINGER) == 0;
 
 	UNUSED_PARAMETER(p);
 
 	set_visible(props, id, SS_SCENE, scene);
 	set_visible(props, id, SS_DURATION, !same && !is_cut && !is_stinger);
-	set_visible(props, id, SS_DIRECTION, is_swipe || is_slide);
-	set_visible(props, id, SS_SWIPE_IN, is_swipe);
-	set_visible(props, id, SS_COLOR, to_color);
-	set_visible(props, id, SS_SWITCH_POINT, to_color);
-	set_visible(props, id, SS_STINGER_PATH, is_stinger);
-	set_visible(props, id, SS_STINGER_POINT, is_stinger);
-	set_visible(props, id, SS_STINGER_HW, is_stinger);
+	si_transition_options_visible(props, &slot_tr_keys[id], same ? "" : type);
 
 	return true;
 }
@@ -2199,12 +2022,7 @@ static const char *image_filter =
 #endif
 	");;All files (*.*)";
 
-static const char *stinger_filter = "Video files (*.mp4 *.m4v *.mov *.mkv *.webm *.ts *.avi *.flv);;All files (*.*)";
 /* clang-format on */
-
-static const char *aspects[] = {"16:9", "16:10", "4:3", "1:1", "9:16"};
-
-#define NUM_ASPECTS (sizeof(aspects) / sizeof(const char *))
 
 /* The names of the scene transitions configured in OBS, plus the one this
  * direction is set to if it has gone missing, so the setting is not silently
@@ -2246,15 +2064,10 @@ static void add_slot_properties(obs_properties_t *props, enum pg_slot_id id, obs
 				    OBS_COMBO_FORMAT_STRING);
 	if (desc->allow_same)
 		obs_property_list_add_string(p, T_TR_SAME, TR_SAME);
-	obs_property_list_add_string(p, T_TR_CUT, TR_CUT);
-	obs_property_list_add_string(p, T_TR_FADE, TR_FADE);
-	obs_property_list_add_string(p, T_TR_SWIPE, TR_SWIPE);
-	obs_property_list_add_string(p, T_TR_SLIDE, TR_SLIDE);
-	obs_property_list_add_string(p, T_TR_FADE_TO_COLOR, TR_FADE_TO_COLOR);
-	obs_property_list_add_string(p, T_TR_STINGER, TR_STINGER);
-#ifdef HAVE_OBS_FRONTEND_API
-	obs_property_list_add_string(p, T_TR_SCENE, TR_SCENE);
-#endif
+	si_transition_list_add_builtins(p);
+	/* only inside the OBS UI, where there are scene transitions to use */
+	if (si_frontend_available())
+		obs_property_list_add_string(p, T_TR_SCENE, TR_SCENE);
 	obs_property_set_modified_callback2(p, slot_type_changed, (void *)desc);
 
 	p = obs_properties_add_list(group, slot_key(key, sizeof(key), id, SS_SCENE), T_TR_SCENE_NAME,
@@ -2265,26 +2078,7 @@ static void add_slot_properties(obs_properties_t *props, enum pg_slot_id id, obs
 	p = obs_properties_add_int(group, slot_key(key, sizeof(key), id, SS_DURATION), T_TR_DURATION, 0, 60000, 50);
 	obs_property_int_set_suffix(p, " ms");
 
-	p = obs_properties_add_list(group, slot_key(key, sizeof(key), id, SS_DIRECTION), T_TR_DIRECTION,
-				    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(p, T_DIR_LEFT, "left");
-	obs_property_list_add_string(p, T_DIR_RIGHT, "right");
-	obs_property_list_add_string(p, T_DIR_UP, "up");
-	obs_property_list_add_string(p, T_DIR_DOWN, "down");
-
-	obs_properties_add_bool(group, slot_key(key, sizeof(key), id, SS_SWIPE_IN), T_TR_SWIPE_IN);
-
-	obs_properties_add_color(group, slot_key(key, sizeof(key), id, SS_COLOR), T_TR_COLOR);
-	p = obs_properties_add_int_slider(group, slot_key(key, sizeof(key), id, SS_SWITCH_POINT), T_TR_SWITCH_POINT, 0,
-					  100, 1);
-	obs_property_int_set_suffix(p, " %");
-
-	obs_properties_add_path(group, slot_key(key, sizeof(key), id, SS_STINGER_PATH), T_TR_STINGER_PATH,
-				OBS_PATH_FILE, stinger_filter, NULL);
-	p = obs_properties_add_int(group, slot_key(key, sizeof(key), id, SS_STINGER_POINT), T_TR_STINGER_POINT, 0,
-				   120000, 50);
-	obs_property_int_set_suffix(p, " ms");
-	obs_properties_add_bool(group, slot_key(key, sizeof(key), id, SS_STINGER_HW), T_TR_STINGER_HW);
+	si_transition_option_properties(group, &slot_tr_keys[id]);
 
 	dstr_copy(&text, "PictureGallery.");
 	dstr_cat(&text, desc->group_text);
@@ -2302,28 +2096,17 @@ static obs_properties_t *pg_properties(void *data)
 {
 	obs_properties_t *props = obs_properties_create();
 	obs_properties_t *playback = obs_properties_create();
-	obs_properties_t *appearance = obs_properties_create();
 	struct picture_gallery *pg = data;
 	obs_data_t *settings = pg ? obs_source_get_settings(pg->source) : NULL;
-	struct obs_video_info ovi;
 	struct dstr last_dir = {0};
 	obs_property_t *p;
-	char res[32];
 
 	/* ----------------- images ----------------- */
 
 	if (pg) {
 		pthread_mutex_lock(&pg->mutex);
-		if (pg->items.num) {
-			struct pg_item *last = da_end(pg->items);
-			const char *slash;
-
-			dstr_copy(&last_dir, last->path);
-			dstr_replace(&last_dir, "\\", "/");
-			slash = strrchr(last_dir.array, '/');
-			if (slash)
-				dstr_resize(&last_dir, slash - last_dir.array + 1);
-		}
+		if (pg->items.num)
+			si_path_directory(pg->items.array[pg->items.num - 1].path, &last_dir);
 		pthread_mutex_unlock(&pg->mutex);
 	}
 
@@ -2355,101 +2138,16 @@ static obs_properties_t *pg_properties(void *data)
 
 	/* ----------------- appearance ----------------- */
 
-	p = obs_properties_add_list(appearance, S_BOUNDING, T_BOUNDING, OBS_COMBO_TYPE_EDITABLE,
-				    OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(p, T_BOUNDING_AUTO, T_BOUNDING_AUTO);
-
-	obs_get_video_info(&ovi);
-	snprintf(res, sizeof(res), "%dx%d", (int)ovi.base_width, (int)ovi.base_height);
-	obs_property_list_add_string(p, res, res);
-
-	for (size_t i = 0; i < NUM_ASPECTS; i++)
-		obs_property_list_add_string(p, aspects[i], aspects[i]);
-
-	p = obs_properties_add_list(appearance, S_SCALE_MODE, T_SCALE_MODE, OBS_COMBO_TYPE_LIST,
-				    OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(p, T_SCALE_FIT, SCALE_FIT);
-	obs_property_list_add_string(p, T_SCALE_STRETCH, SCALE_STRETCH);
-	obs_property_list_add_string(p, T_SCALE_DOWN_ONLY, SCALE_DOWN_ONLY);
-
-	p = obs_properties_add_list(appearance, S_ALIGNMENT, T_ALIGNMENT, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(p, T_ALIGN_CENTER, "center");
-	obs_property_list_add_string(p, T_ALIGN_TOP_LEFT, "topleft");
-	obs_property_list_add_string(p, T_ALIGN_TOP, "top");
-	obs_property_list_add_string(p, T_ALIGN_TOP_RIGHT, "topright");
-	obs_property_list_add_string(p, T_ALIGN_LEFT, "left");
-	obs_property_list_add_string(p, T_ALIGN_RIGHT, "right");
-	obs_property_list_add_string(p, T_ALIGN_BOTTOM_LEFT, "bottomleft");
-	obs_property_list_add_string(p, T_ALIGN_BOTTOM, "bottom");
-	obs_property_list_add_string(p, T_ALIGN_BOTTOM_RIGHT, "bottomright");
-
-	obs_properties_add_group(props, S_GROUP_APPEARANCE, T_GROUP_APPEARANCE, OBS_GROUP_NORMAL, appearance);
+	si_layout_properties(props);
 
 	obs_data_release(settings);
 	return props;
 }
 
-/* ------------------------------------------------------------------------- */
-/* missing files                                                              */
-
-static void missing_file_callback(void *src, const char *new_path, void *data)
-{
-	struct picture_gallery *pg = src;
-	const char *orig_path = data;
-	obs_source_t *source = pg->source;
-	obs_data_t *settings = obs_source_get_settings(source);
-	obs_data_array_t *files = obs_data_get_array(settings, S_FILES);
-	size_t count = obs_data_array_count(files);
-
-	for (size_t i = 0; i < count; i++) {
-		obs_data_t *file = obs_data_array_item(files, i);
-		const char *path = obs_data_get_string(file, "value");
-
-		if (strcmp(path, orig_path) == 0) {
-			if (new_path && *new_path)
-				obs_data_set_string(file, "value", new_path);
-			else
-				obs_data_array_erase(files, i);
-
-			obs_data_release(file);
-			break;
-		}
-
-		obs_data_release(file);
-	}
-
-	obs_source_update(source, settings);
-
-	obs_data_array_release(files);
-	obs_data_release(settings);
-}
-
 static obs_missing_files_t *pg_missing_files(void *data)
 {
 	struct picture_gallery *pg = data;
-	obs_missing_files_t *missing_files = obs_missing_files_create();
-	obs_data_t *settings = obs_source_get_settings(pg->source);
-	obs_data_array_t *files = obs_data_get_array(settings, S_FILES);
-	size_t count = obs_data_array_count(files);
-
-	for (size_t i = 0; i < count; i++) {
-		obs_data_t *item = obs_data_array_item(files, i);
-		const char *path = obs_data_get_string(item, "value");
-
-		if (path && *path && !os_file_exists(path)) {
-			obs_missing_file_t *file = obs_missing_file_create(
-				path, missing_file_callback, OBS_MISSING_FILE_SOURCE, pg->source, (void *)path);
-
-			obs_missing_files_add_file(missing_files, file);
-		}
-
-		obs_data_release(item);
-	}
-
-	obs_data_array_release(files);
-	obs_data_release(settings);
-
-	return missing_files;
+	return si_missing_files(pg->source, &pg->missing_paths);
 }
 
 static enum gs_color_space pg_video_get_color_space(void *data, size_t count,
