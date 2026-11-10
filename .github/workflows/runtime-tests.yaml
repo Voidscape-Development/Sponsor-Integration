@@ -1,0 +1,33 @@
+name: Runtime Tests
+on:
+  workflow_call:
+jobs:
+  runtime-tests:
+    name: Runtime Tests 🧪
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OBS Studio and Test Tools 📦
+        run: |
+          : Install OBS Studio and Test Tools 📦
+          sudo add-apt-repository --yes ppa:obsproject/obs-studio
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libgles2-mesa-dev libsimde-dev libx11-dev \
+            obs-studio xvfb xauth ffmpeg python3
+
+      - name: Build with Runtime Tests 🧱
+        run: |
+          : Build with Runtime Tests 🧱
+          cmake --preset ubuntu-x86_64 -DENABLE_RUNTIME_TESTS=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+          cmake --build build_x86_64
+
+      - name: Run Runtime Tests 🧪
+        run: |
+          : Run Runtime Tests 🧪
+          tests/run-runtime-tests.sh build_x86_64

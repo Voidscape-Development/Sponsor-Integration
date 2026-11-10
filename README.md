@@ -201,6 +201,25 @@ cmake --preset ubuntu-x86_64   # or macos / windows-x64
 cmake --build build_x86_64
 ```
 
+### Runtime tests
+
+`tests/` holds tests that run both sources in real libobs, headless under Xvfb, with the stock image,
+transition and media plugins, and check what they signal and what they actually render. They cover
+the gallery's transitions, gap, loop wrap and end; its controls; the Hide control surviving a restart;
+changing settings while it runs; OBS scene transitions (the test stands in for the OBS frontend);
+a stinger longer than any timeout; the Ad Playlist's rotation; and relinking missing files in both
+sources. Every scenario also fails on any leaked allocation.
+
+On Ubuntu with OBS Studio, `xvfb`, `python3` and (for the stinger test) `ffmpeg` installed:
+
+```sh
+cmake --preset ubuntu-x86_64 -DENABLE_RUNTIME_TESTS=ON
+cmake --build build_x86_64
+tests/run-runtime-tests.sh build_x86_64            # or name scenarios: ... build_x86_64 gap controls
+```
+
+They also run on every pull request and push (`runtime-tests` workflow).
+
 Build documentation for the underlying template lives in the
 [Plugin Template Wiki](https://github.com/obsproject/obs-plugintemplate/wiki):
 [Getting started](https://github.com/obsproject/obs-plugintemplate/wiki/Getting-Started),
@@ -216,6 +235,7 @@ Default workflows are provided for the following repository actions:
 * `dispatch`: triggered from GitHub's workflow dispatch UI.
 * `build-project`: builds the project, triggered by the other workflows.
 * `check-format`: checks CMake and source formatting, triggered by the other workflows.
+* `runtime-tests`: builds with the runtime tests and runs them, triggered by `pr-pull` and `push`.
 
 Successful builds produce downloadable artifacts. To create a release, push a semver tag (e.g.
 `1.2.3`) to the default branch; a draft release is created with installer packages attached.
