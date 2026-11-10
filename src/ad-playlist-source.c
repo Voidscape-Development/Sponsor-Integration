@@ -27,6 +27,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <stdlib.h>
 
 #include "ad-playlist-source.h"
+#include "source-common.h"
 
 #define do_log(level, format, ...) \
 	blog(level, "[ad playlist: '%s'] " format, obs_source_get_name(ap->source), ##__VA_ARGS__)
@@ -451,21 +452,6 @@ static obs_source_t *get_transition(struct ad_playlist *ap)
 	return tr;
 }
 
-static bool is_image_extension(const char *ext)
-{
-	if (!ext)
-		return false;
-
-	return astrcmpi(ext, ".bmp") == 0 || astrcmpi(ext, ".tga") == 0 || astrcmpi(ext, ".png") == 0 ||
-	       astrcmpi(ext, ".jpeg") == 0 || astrcmpi(ext, ".jpg") == 0 || astrcmpi(ext, ".jpe") == 0 ||
-	       astrcmpi(ext, ".jfif") == 0 || astrcmpi(ext, ".gif") == 0 || astrcmpi(ext, ".webp") == 0 ||
-	       astrcmpi(ext, ".psd") == 0 || astrcmpi(ext, ".tif") == 0 || astrcmpi(ext, ".tiff") == 0
-#ifdef _WIN32
-	       || astrcmpi(ext, ".jxr") == 0
-#endif
-		;
-}
-
 static bool is_media_extension(const char *ext)
 {
 	if (!ext)
@@ -483,7 +469,7 @@ static bool is_media_extension(const char *ext)
 
 static inline bool supported_extension(const char *ext)
 {
-	return is_image_extension(ext) || is_media_extension(ext);
+	return si_is_image_extension(ext) || is_media_extension(ext);
 }
 
 static obs_data_t *image_settings(const char *path)
@@ -545,7 +531,7 @@ static obs_source_t *find_existing_source(ad_item_array_t *items, const char *pa
 static void add_item(struct ad_playlist *ap, ad_item_array_t *new_items, const char *path)
 {
 	const char *ext = os_get_path_extension(path);
-	bool is_video = !is_image_extension(ext);
+	bool is_video = !si_is_image_extension(ext);
 	struct ad_item item;
 	obs_data_t *settings;
 	obs_source_t *source;
@@ -1013,28 +999,6 @@ static obs_data_t *build_transition_settings(struct ad_playlist *ap, obs_data_t 
 	return tr_settings;
 }
 
-static uint32_t alignment_from_string(const char *val)
-{
-	if (astrcmpi(val, "topleft") == 0)
-		return OBS_ALIGN_TOP | OBS_ALIGN_LEFT;
-	if (astrcmpi(val, "top") == 0)
-		return OBS_ALIGN_TOP;
-	if (astrcmpi(val, "topright") == 0)
-		return OBS_ALIGN_TOP | OBS_ALIGN_RIGHT;
-	if (astrcmpi(val, "left") == 0)
-		return OBS_ALIGN_LEFT;
-	if (astrcmpi(val, "right") == 0)
-		return OBS_ALIGN_RIGHT;
-	if (astrcmpi(val, "bottomleft") == 0)
-		return OBS_ALIGN_BOTTOM | OBS_ALIGN_LEFT;
-	if (astrcmpi(val, "bottom") == 0)
-		return OBS_ALIGN_BOTTOM;
-	if (astrcmpi(val, "bottomright") == 0)
-		return OBS_ALIGN_BOTTOM | OBS_ALIGN_RIGHT;
-
-	return OBS_ALIGN_CENTER;
-}
-
 /* "1920x1080" is a fixed size, "16:9" is a fixed aspect ratio, and anything
  * else - including the localized "Automatic" entry - means automatic. */
 static void parse_bounding_size(struct ad_playlist *ap, const char *val)
@@ -1263,7 +1227,7 @@ static void ap_update(void *data, obs_data_t *settings)
 	else
 		ap->scale_type = OBS_TRANSITION_SCALE_ASPECT;
 
-	ap->alignment = alignment_from_string(obs_data_get_string(settings, S_ALIGNMENT));
+	ap->alignment = si_alignment_from_string(obs_data_get_string(settings, S_ALIGNMENT));
 
 	/* ------------------------------------- */
 	/* swap in the new state                 */

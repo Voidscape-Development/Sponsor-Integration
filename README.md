@@ -2,7 +2,7 @@
 
 An OBS Studio plugin with tooling for running sponsor and advertising content on stream.
 
-Currently it provides a single source type: **Ad Playlist**.
+It provides two source types: **Ad Playlist** and **Picture Gallery**.
 
 ## Ad Playlist
 
@@ -102,6 +102,82 @@ The source exposes procedures and signals for scripts and `obs-websocket`:
 | proc `total_items(out int total_items)` | Number of items in the playlist. |
 | signal `ad_item_changed(int index, int position, string path, bool is_video)` | An item started. `index` is its place in the playlist, `position` its place in the (possibly shuffled) running order. |
 | signal `ad_playlist_ended()` | A non-looping playlist reached its end. |
+
+## Picture Gallery
+
+An image rotation in the spirit of Image Slide Show, with a **separate transition for every direction
+the gallery moves in** (like the Source Switcher plugin) and an optional **gap** between images.
+
+### Images
+
+Add files or directories with the **Images** list. Any image OBS can load works — `.png`, `.jpg`,
+`.gif`, `.webp`, `.bmp`, `.tga`, `.psd`, `.tif`, … Directories are expanded and sorted by name, and
+are read when the list is edited and when the source is loaded. Animated GIFs/WebPs loop for as long
+as they are on screen.
+
+### Playback
+
+| Setting | Description |
+|---|---|
+| **Hold time** | How long each image is fully on screen. Transitions come on top of this. |
+| **Gap between images** | `0` *(default)* moves straight from one image to the next with the Normal transition. Above `0`, each image goes out with the Hide transition, the gallery stays empty (transparent) for the gap, and the next image comes in with the Show transition. |
+| **Loop gallery** | Start over after the last image. |
+| **Shuffle order** | Shuffles the running order so every image comes up exactly once per pass, without repeating across the loop point. |
+| **Hide when the gallery ends** | With looping off, go out with the Hide transition at the end instead of holding the last image. |
+| **Restart gallery when the source becomes visible** | Start from the first image whenever the source is shown. With this off, it picks up at the image it was on. |
+
+The gallery only advances while the source is visible.
+
+### Transitions
+
+Each of the four directions has its own transition, duration and options:
+
+| Direction | Plays when |
+|---|---|
+| **Normal** (image → image) | One image follows the next with no gap, and on Next/Previous. |
+| **Show** (nothing → image) | The source becomes visible, the gallery is started, restarted or shown again with the Show control, and after a gap. |
+| **Hide** (image → nothing) | Going into a gap, Stop, the Hide control, and the end of a gallery set to hide when it ends. |
+| **Loop wrap** (last → first) | A looping gallery goes from its last image back to its first. *Same as the normal transition* by default. With a gap set, it brings the first image in after the gap in place of Show. |
+
+Every direction can use **Cut**, **Fade**, **Swipe**, **Slide**, **Fade to Color** or **Stinger**, or
+**OBS scene transition** to use one of the transitions set up in the Scene Transitions dock (Move and
+other third-party transitions included). The gallery plays its own copy of a scene transition, with
+the same settings, and follows any change made to them. If a chosen scene transition is renamed or
+removed, that direction falls back to a fade (with a note in the log) until one by that name exists
+again.
+
+OBS hides a scene item instantly, so the eye icon cannot play the Hide transition; hiding and
+showing the source that way cuts out, and the Show transition plays when it comes back. To animate
+the gallery out on demand use the **Hide Picture Gallery** hotkey (or the `hide_gallery` proc), or
+set OBS's own Show/Hide transition on the scene item.
+
+A stinger's own sound plays through the scene the gallery is in.
+
+### Appearance
+
+**Bounding size / aspect ratio**, **Scale mode** and **Alignment** work as they do for the Ad
+Playlist.
+
+### Controls
+
+The gallery appears in the **Media Controls** dock: play/pause (freezes the hold timer), restart,
+stop (goes out with Hide), next and previous (with the Normal transition, or Show when the gallery is
+empty; a manual skip never waits out the gap). Hotkeys are available for all of those plus **Show**
+and **Hide**, which take the gallery out with its Hide transition and bring it back with its Show
+transition, keeping its place.
+
+### Automation
+
+| | |
+|---|---|
+| proc `current_index(out int current_index)` | Index of the current image in the list, or `-1`. |
+| proc `current_path(out string current_path)` | File path of the current image. During a gap, the image coming up next. |
+| proc `total_items(out int total_items)` | Number of images. |
+| proc `show_gallery()` | Bring the gallery back after `hide_gallery`. |
+| proc `hide_gallery()` | Take the gallery out with its Hide transition and keep it out. |
+| proc `is_hidden(out bool hidden)` | Whether the gallery was taken out with `hide_gallery`. |
+| signal `gallery_image_changed(int index, int position, string path)` | An image started coming in. |
+| signal `gallery_ended()` | A non-looping gallery reached its end. |
 
 ## Building
 

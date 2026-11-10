@@ -20,6 +20,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <plugin-support.h>
 
 #include "ad-playlist-source.h"
+#include "picture-gallery-source.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
@@ -37,6 +38,8 @@ MODULE_EXPORT const char *obs_module_name(void)
 bool obs_module_load(void)
 {
 	obs_register_source(&ad_playlist_source_info);
+	obs_register_source(&picture_gallery_source_info);
+	picture_gallery_module_load();
 
 	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
 	return true;
@@ -44,5 +47,6 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+	picture_gallery_module_unload();
 	obs_log(LOG_INFO, "plugin unloaded");
 }
