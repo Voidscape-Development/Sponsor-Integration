@@ -1178,6 +1178,10 @@ int main(int argc, char **argv)
 	scenario->fn();
 
 	obs_set_output_source(0, NULL);
+	/* A public scene stays registered until it is removed, as OBS removes
+	 * one when it is deleted; releasing it alone leaks it from OBS 32 on. */
+	if (scene)
+		obs_source_remove(obs_scene_get_source(scene));
 	obs_scene_release(scene);
 
 	obs_enter_graphics();
