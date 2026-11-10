@@ -27,6 +27,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <stdlib.h>
 
 #include "ad-playlist-source.h"
+#include "playlist-common.h"
 
 #define do_log(level, format, ...) \
 	blog(level, "[ad playlist: '%s'] " format, obs_source_get_name(ap->source), ##__VA_ARGS__)
@@ -36,7 +37,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 /* clang-format off */
 
-#define S_FILES                        "files"
+#define S_FILES                        SI_S_FILES
 #define S_IMAGE_TIME                   "image_duration"
 #define S_LOOP                         "loop"
 #define S_SHUFFLE                      "shuffle"
@@ -60,28 +61,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define S_TR_STINGER_POINT             "stinger_transition_point"
 #define S_TR_STINGER_HW                "stinger_hw_decode"
 
-#define S_BOUNDING                     "bounding_size"
-#define S_SCALE_MODE                   "scale_mode"
-#define S_ALIGNMENT                    "alignment"
-
 #define S_GROUP_PLAYBACK               "playback_group"
 #define S_GROUP_AUDIO                  "audio_group"
 #define S_GROUP_TRANSITION             "transition_group"
-#define S_GROUP_APPEARANCE             "appearance_group"
-
-#define TR_CUT                         "cut"
-#define TR_FADE                        "fade"
-#define TR_SWIPE                       "swipe"
-#define TR_SLIDE                       "slide"
-#define TR_FADE_TO_COLOR               "fade_to_color"
-#define TR_STINGER                     "stinger"
 
 #define TIMING_OVERLAP                 "overlap"
 #define TIMING_AFTER                   "after"
-
-#define SCALE_FIT                      "fit"
-#define SCALE_STRETCH                  "stretch"
-#define SCALE_DOWN_ONLY                "down_only"
 
 #define T_(text) obs_module_text("AdPlaylist." text)
 #define T_AD_PLAYLIST                  T_("Name")
@@ -105,50 +90,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define T_GROUP_PLAYBACK               T_("Group.Playback")
 #define T_GROUP_AUDIO                  T_("Group.Audio")
 #define T_GROUP_TRANSITION             T_("Group.Transition")
-#define T_GROUP_APPEARANCE             T_("Group.Appearance")
 
 #define T_TRANSITION                   T_("Transition")
 #define T_TR_DURATION                  T_("Transition.Duration")
 #define T_TR_TIMING                    T_("Transition.Timing")
 #define T_TR_TIMING_OVERLAP            T_("Transition.Timing.Overlap")
 #define T_TR_TIMING_AFTER              T_("Transition.Timing.After")
-#define T_TR_DIRECTION                 T_("Transition.Direction")
-#define T_TR_SWIPE_IN                  T_("Transition.SwipeIn")
-#define T_TR_COLOR                     T_("Transition.Color")
-#define T_TR_SWITCH_POINT              T_("Transition.SwitchPoint")
-#define T_TR_STINGER_PATH              T_("Transition.Stinger.Path")
-#define T_TR_STINGER_POINT             T_("Transition.Stinger.TransitionPoint")
-#define T_TR_STINGER_HW                T_("Transition.Stinger.HardwareDecode")
-
-#define T_TR_CUT                       T_("Transition.Cut")
-#define T_TR_FADE                      T_("Transition.Fade")
-#define T_TR_SWIPE                     T_("Transition.Swipe")
-#define T_TR_SLIDE                     T_("Transition.Slide")
-#define T_TR_FADE_TO_COLOR             T_("Transition.FadeToColor")
-#define T_TR_STINGER                   T_("Transition.Stinger")
-
-#define T_DIR_LEFT                     T_("Direction.Left")
-#define T_DIR_RIGHT                    T_("Direction.Right")
-#define T_DIR_UP                       T_("Direction.Up")
-#define T_DIR_DOWN                     T_("Direction.Down")
-
-#define T_BOUNDING                     T_("BoundingSize")
-#define T_BOUNDING_AUTO                T_("BoundingSize.Auto")
-#define T_SCALE_MODE                   T_("ScaleMode")
-#define T_SCALE_FIT                    T_("ScaleMode.Fit")
-#define T_SCALE_STRETCH                T_("ScaleMode.Stretch")
-#define T_SCALE_DOWN_ONLY              T_("ScaleMode.DownOnly")
-#define T_ALIGNMENT                    T_("Alignment")
-
-#define T_ALIGN_CENTER                 T_("Align.Center")
-#define T_ALIGN_TOP_LEFT               T_("Align.TopLeft")
-#define T_ALIGN_TOP                    T_("Align.Top")
-#define T_ALIGN_TOP_RIGHT              T_("Align.TopRight")
-#define T_ALIGN_LEFT                   T_("Align.Left")
-#define T_ALIGN_RIGHT                  T_("Align.Right")
-#define T_ALIGN_BOTTOM_LEFT            T_("Align.BottomLeft")
-#define T_ALIGN_BOTTOM                 T_("Align.Bottom")
-#define T_ALIGN_BOTTOM_RIGHT           T_("Align.BottomRight")
 
 #define T_HK_PLAY_PAUSE                T_("Hotkey.PlayPause")
 #define T_HK_RESTART                   T_("Hotkey.Restart")
@@ -157,9 +104,6 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define T_HK_PREVIOUS                  T_("Hotkey.Previous")
 
 /* clang-format on */
-
-/* Maximum number of files pulled in from a single directory entry. */
-#define MAX_DIR_FILES 500
 
 /* Seconds to wait for a media file to start playing before giving up on it and
  * moving on. Keeps a broken or unsupported file from stalling the playlist. */
@@ -234,6 +178,17 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #define LN_SILENCE (-200.0)
 #define LN_PI 3.14159265358979323846
+
+/* where the transition's options are kept */
+static const struct si_tr_keys tr_keys = {
+	.direction = S_TR_DIRECTION,
+	.swipe_in = S_TR_SWIPE_IN,
+	.color = S_TR_COLOR,
+	.switch_point = S_TR_SWITCH_POINT,
+	.stinger_path = S_TR_STINGER_PATH,
+	.stinger_point = S_TR_STINGER_POINT,
+	.stinger_hw = S_TR_STINGER_HW,
+};
 
 /* ------------------------------------------------------------------------- */
 
@@ -344,8 +299,6 @@ struct ap_audio {
 };
 
 typedef DARRAY(struct ad_item) ad_item_array_t;
-typedef DARRAY(size_t) index_array_t;
-typedef DARRAY(char *) path_array_t;
 
 struct ad_playlist {
 	obs_source_t *source;
@@ -382,13 +335,13 @@ struct ad_playlist {
 	 * `configured_paths` is the file list as it is configured, before
 	 * directories are expanded.
 	 */
-	path_array_t configured_paths;
+	si_path_array_t configured_paths;
 	char *tr_settings_sig;
 
 	/* ---- children ---- */
 	obs_source_t *transition;
 	ad_item_array_t items;
-	index_array_t order;
+	si_index_array_t order;
 
 	/* ---- playback state ---- */
 	size_t order_pos;
@@ -409,12 +362,7 @@ struct ad_playlist {
 	uint32_t cy;
 	uint32_t content_cx;
 	uint32_t content_cy;
-	bool auto_size;
-	bool aspect_only;
-	uint32_t bound_cx;
-	uint32_t bound_cy;
-	enum obs_transition_scale_type scale_type;
-	uint32_t alignment;
+	struct si_layout layout;
 	float size_timer;
 
 	/* ---- audio ---- */
@@ -425,11 +373,8 @@ struct ad_playlist {
 	/* where the items' audio is mixed on its way out to OBS; guards itself */
 	struct ap_audio audio;
 
-	obs_hotkey_id play_pause_hotkey;
-	obs_hotkey_id restart_hotkey;
-	obs_hotkey_id stop_hotkey;
-	obs_hotkey_id next_hotkey;
-	obs_hotkey_id prev_hotkey;
+	/* paths handed to the missing files dialog */
+	si_missing_array_t missing_paths;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -451,39 +396,9 @@ static obs_source_t *get_transition(struct ad_playlist *ap)
 	return tr;
 }
 
-static bool is_image_extension(const char *ext)
-{
-	if (!ext)
-		return false;
-
-	return astrcmpi(ext, ".bmp") == 0 || astrcmpi(ext, ".tga") == 0 || astrcmpi(ext, ".png") == 0 ||
-	       astrcmpi(ext, ".jpeg") == 0 || astrcmpi(ext, ".jpg") == 0 || astrcmpi(ext, ".jpe") == 0 ||
-	       astrcmpi(ext, ".jfif") == 0 || astrcmpi(ext, ".gif") == 0 || astrcmpi(ext, ".webp") == 0 ||
-	       astrcmpi(ext, ".psd") == 0 || astrcmpi(ext, ".tif") == 0 || astrcmpi(ext, ".tiff") == 0
-#ifdef _WIN32
-	       || astrcmpi(ext, ".jxr") == 0
-#endif
-		;
-}
-
-static bool is_media_extension(const char *ext)
-{
-	if (!ext)
-		return false;
-
-	return astrcmpi(ext, ".mp4") == 0 || astrcmpi(ext, ".m4v") == 0 || astrcmpi(ext, ".mov") == 0 ||
-	       astrcmpi(ext, ".mkv") == 0 || astrcmpi(ext, ".webm") == 0 || astrcmpi(ext, ".ts") == 0 ||
-	       astrcmpi(ext, ".m2ts") == 0 || astrcmpi(ext, ".mts") == 0 || astrcmpi(ext, ".mpg") == 0 ||
-	       astrcmpi(ext, ".mpeg") == 0 || astrcmpi(ext, ".avi") == 0 || astrcmpi(ext, ".flv") == 0 ||
-	       astrcmpi(ext, ".wmv") == 0 || astrcmpi(ext, ".mxf") == 0 || astrcmpi(ext, ".3gp") == 0 ||
-	       astrcmpi(ext, ".mp3") == 0 || astrcmpi(ext, ".aac") == 0 || astrcmpi(ext, ".m4a") == 0 ||
-	       astrcmpi(ext, ".wav") == 0 || astrcmpi(ext, ".ogg") == 0 || astrcmpi(ext, ".opus") == 0 ||
-	       astrcmpi(ext, ".flac") == 0;
-}
-
 static inline bool supported_extension(const char *ext)
 {
-	return is_image_extension(ext) || is_media_extension(ext);
+	return si_is_image_extension(ext) || si_is_media_extension(ext);
 }
 
 static obs_data_t *image_settings(const char *path)
@@ -545,7 +460,7 @@ static obs_source_t *find_existing_source(ad_item_array_t *items, const char *pa
 static void add_item(struct ad_playlist *ap, ad_item_array_t *new_items, const char *path)
 {
 	const char *ext = os_get_path_extension(path);
-	bool is_video = !is_image_extension(ext);
+	bool is_video = !si_is_image_extension(ext);
 	struct ad_item item;
 	obs_data_t *settings;
 	obs_source_t *source;
@@ -588,106 +503,18 @@ static void add_item(struct ad_playlist *ap, ad_item_array_t *new_items, const c
 	da_push_back(*new_items, &item);
 }
 
-static int compare_paths(const void *a, const void *b)
-{
-	return astrcmpi(*(const char *const *)a, *(const char *const *)b);
-}
-
-/* Adds every supported file in `path`. Returns false if it is not a directory. */
-static bool add_directory(struct ad_playlist *ap, ad_item_array_t *new_items, const char *path)
-{
-	DARRAY(char *) entries;
-	struct dstr file_path = {0};
-	os_dir_t *dir = os_opendir(path);
-
-	if (!dir)
-		return false;
-
-	da_init(entries);
-
-	for (;;) {
-		struct os_dirent *ent = os_readdir(dir);
-		const char *ext;
-		char *entry;
-
-		if (!ent)
-			break;
-		if (ent->directory)
-			continue;
-
-		ext = os_get_path_extension(ent->d_name);
-		if (!supported_extension(ext))
-			continue;
-
-		entry = bstrdup(ent->d_name);
-		da_push_back(entries, &entry);
-
-		if (entries.num >= MAX_DIR_FILES) {
-			warn("directory '%s' holds more than %d usable files, ignoring the rest", path, MAX_DIR_FILES);
-			break;
-		}
-	}
-
-	os_closedir(dir);
-
-	/* directory order is filesystem dependent - sort so a playlist plays in
-	 * the same order on every machine and every launch */
-	if (entries.num > 1)
-		qsort(entries.array, entries.num, sizeof(char *), compare_paths);
-
-	for (size_t i = 0; i < entries.num; i++) {
-		dstr_copy(&file_path, path);
-		dstr_cat_ch(&file_path, '/');
-		dstr_cat(&file_path, entries.array[i]);
-		add_item(ap, new_items, file_path.array);
-		bfree(entries.array[i]);
-	}
-
-	dstr_free(&file_path);
-	da_free(entries);
-
-	return true;
-}
-
 /* ------------------------------------------------------------------------- */
 /* playback order                                                             */
 
 static void build_order(struct ad_playlist *ap)
 {
-	size_t count = ap->items.num;
-
-	da_resize(ap->order, count);
-
-	for (size_t i = 0; i < count; i++)
-		ap->order.array[i] = i;
-
-	if (!ap->shuffle || count < 2)
-		return;
-
-	/* Fisher-Yates. Shuffling the order (rather than picking at random each
-	 * time) guarantees every sponsor spot runs exactly once per pass. */
-	for (size_t i = count - 1; i > 0; i--) {
-		size_t j = (size_t)(rand() % (int)(i + 1));
-		size_t tmp = ap->order.array[i];
-
-		ap->order.array[i] = ap->order.array[j];
-		ap->order.array[j] = tmp;
-	}
+	si_order_build(&ap->order, ap->items.num, ap->shuffle);
 }
 
 /* Reshuffle for the next pass without repeating an item across the loop point. */
 static void reshuffle_order(struct ad_playlist *ap)
 {
-	size_t last = ap->order.num ? ap->order.array[ap->order.num - 1] : 0;
-
-	build_order(ap);
-
-	if (ap->order.num > 1 && ap->order.array[0] == last) {
-		size_t tmp = ap->order.array[0];
-
-		ap->order.array[0] = ap->order.array[ap->order.num - 1];
-		ap->order.array[ap->order.num - 1] = tmp;
-	}
+	si_order_reshuffle(&ap->order, ap->items.num, ap->shuffle);
 }
 
 static inline bool item_valid(struct ad_playlist *ap)
@@ -938,24 +765,7 @@ static void update_size(struct ad_playlist *ap)
 	ap->content_cx = cx;
 	ap->content_cy = cy;
 
-	if (!ap->auto_size) {
-		if (ap->aspect_only) {
-			if (cx && cy) {
-				double cx_f = (double)cx;
-				double cy_f = (double)cy;
-				double old_aspect = cx_f / cy_f;
-				double new_aspect = (double)ap->bound_cx / (double)ap->bound_cy;
-
-				if (new_aspect > old_aspect)
-					cx = (uint32_t)(cy_f * new_aspect);
-				else
-					cy = (uint32_t)(cx_f / new_aspect);
-			}
-		} else {
-			cx = ap->bound_cx;
-			cy = ap->bound_cy;
-		}
-	}
+	si_layout_size(&ap->layout, cx, cy, &cx, &cy);
 
 	if (cx == ap->cx && cy == ap->cy)
 		return;
@@ -969,141 +779,6 @@ static void update_size(struct ad_playlist *ap)
 
 /* ------------------------------------------------------------------------- */
 /* settings                                                                   */
-
-static const char *transition_id_for(const char *type, bool *is_cut, bool *is_stinger)
-{
-	*is_cut = false;
-	*is_stinger = false;
-
-	if (astrcmpi(type, TR_CUT) == 0) {
-		*is_cut = true;
-		return "cut_transition";
-	}
-	if (astrcmpi(type, TR_SWIPE) == 0)
-		return "swipe_transition";
-	if (astrcmpi(type, TR_SLIDE) == 0)
-		return "slide_transition";
-	if (astrcmpi(type, TR_FADE_TO_COLOR) == 0)
-		return "fade_to_color_transition";
-	if (astrcmpi(type, TR_STINGER) == 0) {
-		*is_stinger = true;
-		return "obs_stinger_transition";
-	}
-
-	return "fade_transition";
-}
-
-static obs_data_t *build_transition_settings(struct ad_playlist *ap, obs_data_t *settings)
-{
-	obs_data_t *tr_settings = obs_data_create();
-
-	if (strcmp(ap->tr_id, "swipe_transition") == 0 || strcmp(ap->tr_id, "slide_transition") == 0) {
-		obs_data_set_string(tr_settings, "direction", obs_data_get_string(settings, S_TR_DIRECTION));
-		obs_data_set_bool(tr_settings, "swipe_in", obs_data_get_bool(settings, S_TR_SWIPE_IN));
-	} else if (strcmp(ap->tr_id, "fade_to_color_transition") == 0) {
-		obs_data_set_int(tr_settings, "color", obs_data_get_int(settings, S_TR_COLOR));
-		obs_data_set_int(tr_settings, "switch_point", obs_data_get_int(settings, S_TR_SWITCH_POINT));
-	} else if (ap->use_stinger) {
-		obs_data_set_string(tr_settings, "path", obs_data_get_string(settings, S_TR_STINGER_PATH));
-		obs_data_set_int(tr_settings, "tp_type", 0 /* transition point in milliseconds */);
-		obs_data_set_int(tr_settings, "transition_point", (long long)ap->stinger_point_ms);
-		obs_data_set_bool(tr_settings, "hw_decode", obs_data_get_bool(settings, S_TR_STINGER_HW));
-	}
-
-	return tr_settings;
-}
-
-static uint32_t alignment_from_string(const char *val)
-{
-	if (astrcmpi(val, "topleft") == 0)
-		return OBS_ALIGN_TOP | OBS_ALIGN_LEFT;
-	if (astrcmpi(val, "top") == 0)
-		return OBS_ALIGN_TOP;
-	if (astrcmpi(val, "topright") == 0)
-		return OBS_ALIGN_TOP | OBS_ALIGN_RIGHT;
-	if (astrcmpi(val, "left") == 0)
-		return OBS_ALIGN_LEFT;
-	if (astrcmpi(val, "right") == 0)
-		return OBS_ALIGN_RIGHT;
-	if (astrcmpi(val, "bottomleft") == 0)
-		return OBS_ALIGN_BOTTOM | OBS_ALIGN_LEFT;
-	if (astrcmpi(val, "bottom") == 0)
-		return OBS_ALIGN_BOTTOM;
-	if (astrcmpi(val, "bottomright") == 0)
-		return OBS_ALIGN_BOTTOM | OBS_ALIGN_RIGHT;
-
-	return OBS_ALIGN_CENTER;
-}
-
-/* "1920x1080" is a fixed size, "16:9" is a fixed aspect ratio, and anything
- * else - including the localized "Automatic" entry - means automatic. */
-static void parse_bounding_size(struct ad_playlist *ap, const char *val)
-{
-	int cx = 0;
-	int cy = 0;
-
-	ap->auto_size = true;
-	ap->aspect_only = false;
-
-	if (!val || !*val)
-		return;
-
-	if (sscanf(val, "%dx%d", &cx, &cy) == 2 && cx > 0 && cy > 0) {
-		ap->auto_size = false;
-		ap->aspect_only = false;
-	} else if (sscanf(val, "%d:%d", &cx, &cy) == 2 && cx > 0 && cy > 0) {
-		ap->auto_size = false;
-		ap->aspect_only = true;
-	} else {
-		return;
-	}
-
-	ap->bound_cx = (uint32_t)cx;
-	ap->bound_cy = (uint32_t)cy;
-}
-
-static void free_paths(path_array_t *paths)
-{
-	for (size_t i = 0; i < paths->num; i++)
-		bfree(paths->array[i]);
-
-	da_free(*paths);
-}
-
-/* The playlist as it is configured, with the blank entries dropped and the
- * directories still unexpanded. */
-static void read_configured_paths(obs_data_t *settings, path_array_t *paths)
-{
-	obs_data_array_t *array = obs_data_get_array(settings, S_FILES);
-	size_t count = obs_data_array_count(array);
-
-	for (size_t i = 0; i < count; i++) {
-		obs_data_t *item = obs_data_array_item(array, i);
-		const char *path = obs_data_get_string(item, "value");
-
-		if (path && *path) {
-			char *copy = bstrdup(path);
-			da_push_back(*paths, &copy);
-		}
-
-		obs_data_release(item);
-	}
-
-	obs_data_array_release(array);
-}
-
-static bool paths_equal(const path_array_t *a, const path_array_t *b)
-{
-	if (a->num != b->num)
-		return false;
-
-	for (size_t i = 0; i < a->num; i++) {
-		if (strcmp(a->array[i], b->array[i]) != 0)
-			return false;
-	}
-
-	return true;
-}
 
 static char *transition_signature(obs_data_t *tr_settings)
 {
@@ -1149,6 +824,12 @@ static void connect_transition(struct ad_playlist *ap, obs_source_t *tr, bool co
  * media file and restarts playback from the top, so it only runs when the
  * settings behind the children actually changed - a volume drag just stores a
  * float and leaves the rotation alone.
+ *
+ * libobs never runs this on the caller's thread for a video source:
+ * obs_source_update() only merges the settings and counts the update, and the
+ * update itself runs on the graphics thread's next tick. Updates are therefore
+ * serialized with each other and with video_tick(); only the mutex shared with
+ * the audio, render and proc callbacks is needed.
  */
 static void ap_update(void *data, obs_data_t *settings)
 {
@@ -1158,9 +839,9 @@ static void ap_update(void *data, obs_data_t *settings)
 	obs_source_t *new_tr = NULL;
 	obs_source_t *old_tr = NULL;
 	obs_data_t *tr_settings;
-	path_array_t paths;
+	si_path_array_t paths;
+	si_path_array_t files;
 	const char *tr_type;
-	const char *scale_mode;
 	bool is_cut;
 	bool is_stinger;
 	bool shuffle;
@@ -1174,6 +855,7 @@ static void ap_update(void *data, obs_data_t *settings)
 	da_init(new_items);
 	da_init(old_items);
 	da_init(paths);
+	da_init(files);
 
 	/* ------------------------------------- */
 	/* plain settings                        */
@@ -1202,7 +884,7 @@ static void ap_update(void *data, obs_data_t *settings)
 	pthread_mutex_unlock(&ap->audio.mutex);
 
 	tr_type = obs_data_get_string(settings, S_TRANSITION);
-	ap->tr_id = transition_id_for(tr_type, &is_cut, &is_stinger);
+	ap->tr_id = si_transition_id(tr_type, &is_cut, &is_stinger);
 	ap->use_cut = is_cut;
 	ap->use_stinger = is_stinger;
 	ap->use_to_color = strcmp(ap->tr_id, "fade_to_color_transition") == 0;
@@ -1230,40 +912,31 @@ static void ap_update(void *data, obs_data_t *settings)
 	 * filesystem, and handing a media source new settings makes it reopen
 	 * its file, neither of which survives being done once per slider step.
 	 */
-	read_configured_paths(settings, &paths);
+	si_paths_read(settings, S_FILES, &paths);
 
 	reload_items = first_update || preload != ap->preload || hw_decode != ap->hw_decode ||
-		       !paths_equal(&paths, &ap->configured_paths);
+		       !si_paths_equal(&paths, &ap->configured_paths);
 
 	ap->preload = preload;
 	ap->hw_decode = hw_decode;
 
 	if (reload_items) {
-		for (size_t i = 0; i < paths.num; i++) {
-			if (!add_directory(ap, &new_items, paths.array[i]))
-				add_item(ap, &new_items, paths.array[i]);
-		}
+		si_paths_expand(&paths, supported_extension, obs_source_get_name(ap->source), &files);
 
-		free_paths(&ap->configured_paths);
+		for (size_t i = 0; i < files.num; i++)
+			add_item(ap, &new_items, files.array[i]);
+
+		si_paths_free(&files);
+		si_paths_free(&ap->configured_paths);
 		ap->configured_paths = paths;
 	} else {
-		free_paths(&paths);
+		si_paths_free(&paths);
 	}
 
 	/* ------------------------------------- */
 	/* appearance                            */
 
-	parse_bounding_size(ap, obs_data_get_string(settings, S_BOUNDING));
-
-	scale_mode = obs_data_get_string(settings, S_SCALE_MODE);
-	if (astrcmpi(scale_mode, SCALE_STRETCH) == 0)
-		ap->scale_type = OBS_TRANSITION_SCALE_STRETCH;
-	else if (astrcmpi(scale_mode, SCALE_DOWN_ONLY) == 0)
-		ap->scale_type = OBS_TRANSITION_SCALE_MAX_ONLY;
-	else
-		ap->scale_type = OBS_TRANSITION_SCALE_ASPECT;
-
-	ap->alignment = alignment_from_string(obs_data_get_string(settings, S_ALIGNMENT));
+	si_layout_read(&ap->layout, settings);
 
 	/* ------------------------------------- */
 	/* swap in the new state                 */
@@ -1309,7 +982,7 @@ static void ap_update(void *data, obs_data_t *settings)
 		return;
 	}
 
-	tr_settings = build_transition_settings(ap, settings);
+	tr_settings = si_transition_settings(ap->tr_id, &tr_keys, settings);
 	tr_settings_moved = signature_changed(&ap->tr_settings_sig, transition_signature(tr_settings));
 
 	/* a stinger reopens its video every time it is updated, so only hand the
@@ -1319,8 +992,7 @@ static void ap_update(void *data, obs_data_t *settings)
 
 	obs_data_release(tr_settings);
 
-	obs_transition_set_alignment(ap->transition, ap->alignment);
-	obs_transition_set_scale_type(ap->transition, ap->scale_type);
+	si_layout_apply(&ap->layout, ap->transition);
 
 	if (new_tr)
 		obs_source_add_active_child(ap->source, new_tr);
@@ -1501,64 +1173,6 @@ static void ap_set_time(void *data, int64_t ms)
 	}
 
 	pthread_mutex_unlock(&ap->mutex);
-}
-
-/* ------------------------------------------------------------------------- */
-/* hotkeys                                                                    */
-
-static void play_pause_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
-{
-	struct ad_playlist *ap = data;
-
-	UNUSED_PARAMETER(id);
-	UNUSED_PARAMETER(hotkey);
-
-	if (pressed && obs_source_showing(ap->source))
-		obs_source_media_play_pause(ap->source, !ap->paused);
-}
-
-static void restart_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
-{
-	struct ad_playlist *ap = data;
-
-	UNUSED_PARAMETER(id);
-	UNUSED_PARAMETER(hotkey);
-
-	if (pressed && obs_source_showing(ap->source))
-		obs_source_media_restart(ap->source);
-}
-
-static void stop_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
-{
-	struct ad_playlist *ap = data;
-
-	UNUSED_PARAMETER(id);
-	UNUSED_PARAMETER(hotkey);
-
-	if (pressed && obs_source_showing(ap->source))
-		obs_source_media_stop(ap->source);
-}
-
-static void next_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
-{
-	struct ad_playlist *ap = data;
-
-	UNUSED_PARAMETER(id);
-	UNUSED_PARAMETER(hotkey);
-
-	if (pressed && obs_source_showing(ap->source))
-		obs_source_media_next(ap->source);
-}
-
-static void previous_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
-{
-	struct ad_playlist *ap = data;
-
-	UNUSED_PARAMETER(id);
-	UNUSED_PARAMETER(hotkey);
-
-	if (pressed && obs_source_showing(ap->source))
-		obs_source_media_previous(ap->source);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2535,7 +2149,8 @@ static void ap_destroy(void *data)
 	da_free(ap->order);
 	bfree(ap->tr_type);
 	bfree(ap->tr_settings_sig);
-	free_paths(&ap->configured_paths);
+	si_paths_free(&ap->configured_paths);
+	si_missing_free(&ap->missing_paths);
 
 	for (size_t i = 0; i < ap->audio.records.num; i++)
 		bfree(ap->audio.records.array[i].path);
@@ -2554,14 +2169,14 @@ static void *ap_create(obs_data_t *settings, obs_source_t *source)
 
 	ap->source = source;
 	ap->state = OBS_MEDIA_STATE_NONE;
-	ap->scale_type = OBS_TRANSITION_SCALE_ASPECT;
-	ap->alignment = OBS_ALIGN_CENTER;
-	ap->auto_size = true;
+	si_layout_init(&ap->layout);
 	ap->audio.volume = 1.0f;
 
 	da_init(ap->items);
 	da_init(ap->order);
 	da_init(ap->audio.records);
+	da_init(ap->configured_paths);
+	da_init(ap->missing_paths);
 
 	pthread_mutex_init_value(&ap->mutex);
 	if (pthread_mutex_init_recursive(&ap->mutex) != 0) {
@@ -2576,13 +2191,11 @@ static void *ap_create(obs_data_t *settings, obs_source_t *source)
 		return NULL;
 	}
 
-	ap->play_pause_hotkey =
-		obs_hotkey_register_source(source, "AdPlaylist.PlayPause", T_HK_PLAY_PAUSE, play_pause_hotkey, ap);
-	ap->restart_hotkey = obs_hotkey_register_source(source, "AdPlaylist.Restart", T_HK_RESTART, restart_hotkey, ap);
-	ap->stop_hotkey = obs_hotkey_register_source(source, "AdPlaylist.Stop", T_HK_STOP, stop_hotkey, ap);
-	ap->next_hotkey = obs_hotkey_register_source(source, "AdPlaylist.NextItem", T_HK_NEXT, next_hotkey, ap);
-	ap->prev_hotkey =
-		obs_hotkey_register_source(source, "AdPlaylist.PreviousItem", T_HK_PREVIOUS, previous_hotkey, ap);
+	si_media_hotkeys_register(
+		source,
+		&(struct si_hotkey_names){"AdPlaylist.PlayPause", "AdPlaylist.Restart", "AdPlaylist.Stop",
+					  "AdPlaylist.NextItem", "AdPlaylist.PreviousItem"},
+		&(struct si_hotkey_names){T_HK_PLAY_PAUSE, T_HK_RESTART, T_HK_STOP, T_HK_NEXT, T_HK_PREVIOUS});
 
 	proc_handler_add(ph, "void current_index(out int current_index)", current_index_proc, ap);
 	proc_handler_add(ph, "void current_path(out string current_path)", current_path_proc, ap);
@@ -2819,41 +2432,24 @@ static void ap_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, S_NORM_TARGET, -18);
 	obs_data_set_default_int(settings, S_NORM_MAX_BOOST, 12);
 
-	obs_data_set_default_string(settings, S_TRANSITION, TR_FADE);
+	obs_data_set_default_string(settings, S_TRANSITION, SI_TR_FADE);
 	obs_data_set_default_int(settings, S_TR_DURATION, 500);
 	obs_data_set_default_string(settings, S_TR_TIMING, TIMING_OVERLAP);
-	obs_data_set_default_string(settings, S_TR_DIRECTION, "left");
-	obs_data_set_default_bool(settings, S_TR_SWIPE_IN, false);
-	obs_data_set_default_int(settings, S_TR_COLOR, 0xFF000000);
-	obs_data_set_default_int(settings, S_TR_SWITCH_POINT, 50);
-	obs_data_set_default_int(settings, S_TR_STINGER_POINT, 1000);
-	obs_data_set_default_bool(settings, S_TR_STINGER_HW, true);
-
-	obs_data_set_default_string(settings, S_BOUNDING, T_BOUNDING_AUTO);
-	obs_data_set_default_string(settings, S_SCALE_MODE, SCALE_FIT);
-	obs_data_set_default_string(settings, S_ALIGNMENT, "center");
+	si_transition_defaults(settings, &tr_keys);
+	si_layout_defaults(settings);
 }
 
 static bool transition_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
 {
 	const char *type = obs_data_get_string(settings, S_TRANSITION);
-	bool is_cut = astrcmpi(type, TR_CUT) == 0;
-	bool is_swipe = astrcmpi(type, TR_SWIPE) == 0;
-	bool is_stinger = astrcmpi(type, TR_STINGER) == 0;
-	bool directional = is_swipe || astrcmpi(type, TR_SLIDE) == 0;
-	bool to_color = astrcmpi(type, TR_FADE_TO_COLOR) == 0;
+	bool is_cut = astrcmpi(type, SI_TR_CUT) == 0;
+	bool is_stinger = astrcmpi(type, SI_TR_STINGER) == 0;
 
 	UNUSED_PARAMETER(p);
 
 	obs_property_set_visible(obs_properties_get(props, S_TR_DURATION), !is_cut && !is_stinger);
 	obs_property_set_visible(obs_properties_get(props, S_TR_TIMING), !is_cut);
-	obs_property_set_visible(obs_properties_get(props, S_TR_DIRECTION), directional);
-	obs_property_set_visible(obs_properties_get(props, S_TR_SWIPE_IN), is_swipe);
-	obs_property_set_visible(obs_properties_get(props, S_TR_COLOR), to_color);
-	obs_property_set_visible(obs_properties_get(props, S_TR_SWITCH_POINT), to_color);
-	obs_property_set_visible(obs_properties_get(props, S_TR_STINGER_PATH), is_stinger);
-	obs_property_set_visible(obs_properties_get(props, S_TR_STINGER_POINT), is_stinger);
-	obs_property_set_visible(obs_properties_get(props, S_TR_STINGER_HW), is_stinger);
+	si_transition_options_visible(props, &tr_keys, type);
 
 	return true;
 }
@@ -2880,12 +2476,7 @@ static const char *media_filter =
 #endif
 	");;All files (*.*)";
 
-static const char *stinger_filter = "Video files (*.mp4 *.m4v *.mov *.mkv *.webm *.ts *.avi *.flv);;All files (*.*)";
 /* clang-format on */
-
-static const char *aspects[] = {"16:9", "16:10", "4:3", "1:1", "9:16"};
-
-#define NUM_ASPECTS (sizeof(aspects) / sizeof(const char *))
 
 static obs_properties_t *ap_properties(void *data)
 {
@@ -2893,27 +2484,16 @@ static obs_properties_t *ap_properties(void *data)
 	obs_properties_t *playback = obs_properties_create();
 	obs_properties_t *audio = obs_properties_create();
 	obs_properties_t *transition = obs_properties_create();
-	obs_properties_t *appearance = obs_properties_create();
 	struct ad_playlist *ap = data;
-	struct obs_video_info ovi;
 	struct dstr last_dir = {0};
 	obs_property_t *p;
-	char res[32];
 
 	/* ----------------- playlist ----------------- */
 
 	if (ap) {
 		pthread_mutex_lock(&ap->mutex);
-		if (ap->items.num) {
-			struct ad_item *last = da_end(ap->items);
-			const char *slash;
-
-			dstr_copy(&last_dir, last->path);
-			dstr_replace(&last_dir, "\\", "/");
-			slash = strrchr(last_dir.array, '/');
-			if (slash)
-				dstr_resize(&last_dir, slash - last_dir.array + 1);
-		}
+		if (ap->items.num)
+			si_path_directory(ap->items.array[ap->items.num - 1].path, &last_dir);
 		pthread_mutex_unlock(&ap->mutex);
 	}
 
@@ -2960,12 +2540,7 @@ static obs_properties_t *ap_properties(void *data)
 
 	p = obs_properties_add_list(transition, S_TRANSITION, T_TRANSITION, OBS_COMBO_TYPE_LIST,
 				    OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(p, T_TR_CUT, TR_CUT);
-	obs_property_list_add_string(p, T_TR_FADE, TR_FADE);
-	obs_property_list_add_string(p, T_TR_SWIPE, TR_SWIPE);
-	obs_property_list_add_string(p, T_TR_SLIDE, TR_SLIDE);
-	obs_property_list_add_string(p, T_TR_FADE_TO_COLOR, TR_FADE_TO_COLOR);
-	obs_property_list_add_string(p, T_TR_STINGER, TR_STINGER);
+	si_transition_list_add_builtins(p);
 	obs_property_set_modified_callback(p, transition_changed);
 
 	p = obs_properties_add_int(transition, S_TR_DURATION, T_TR_DURATION, 0, 60000, 50);
@@ -2975,118 +2550,21 @@ static obs_properties_t *ap_properties(void *data)
 	obs_property_list_add_string(p, T_TR_TIMING_OVERLAP, TIMING_OVERLAP);
 	obs_property_list_add_string(p, T_TR_TIMING_AFTER, TIMING_AFTER);
 
-	p = obs_properties_add_list(transition, S_TR_DIRECTION, T_TR_DIRECTION, OBS_COMBO_TYPE_LIST,
-				    OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(p, T_DIR_LEFT, "left");
-	obs_property_list_add_string(p, T_DIR_RIGHT, "right");
-	obs_property_list_add_string(p, T_DIR_UP, "up");
-	obs_property_list_add_string(p, T_DIR_DOWN, "down");
-
-	obs_properties_add_bool(transition, S_TR_SWIPE_IN, T_TR_SWIPE_IN);
-
-	obs_properties_add_color(transition, S_TR_COLOR, T_TR_COLOR);
-	obs_properties_add_int_slider(transition, S_TR_SWITCH_POINT, T_TR_SWITCH_POINT, 0, 100, 1);
-
-	obs_properties_add_path(transition, S_TR_STINGER_PATH, T_TR_STINGER_PATH, OBS_PATH_FILE, stinger_filter, NULL);
-	p = obs_properties_add_int(transition, S_TR_STINGER_POINT, T_TR_STINGER_POINT, 0, 120000, 50);
-	obs_property_int_set_suffix(p, " ms");
-	obs_properties_add_bool(transition, S_TR_STINGER_HW, T_TR_STINGER_HW);
+	si_transition_option_properties(transition, &tr_keys);
 
 	obs_properties_add_group(props, S_GROUP_TRANSITION, T_GROUP_TRANSITION, OBS_GROUP_NORMAL, transition);
 
 	/* ----------------- appearance ----------------- */
 
-	p = obs_properties_add_list(appearance, S_BOUNDING, T_BOUNDING, OBS_COMBO_TYPE_EDITABLE,
-				    OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(p, T_BOUNDING_AUTO, T_BOUNDING_AUTO);
-
-	obs_get_video_info(&ovi);
-	snprintf(res, sizeof(res), "%dx%d", (int)ovi.base_width, (int)ovi.base_height);
-	obs_property_list_add_string(p, res, res);
-
-	for (size_t i = 0; i < NUM_ASPECTS; i++)
-		obs_property_list_add_string(p, aspects[i], aspects[i]);
-
-	p = obs_properties_add_list(appearance, S_SCALE_MODE, T_SCALE_MODE, OBS_COMBO_TYPE_LIST,
-				    OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(p, T_SCALE_FIT, SCALE_FIT);
-	obs_property_list_add_string(p, T_SCALE_STRETCH, SCALE_STRETCH);
-	obs_property_list_add_string(p, T_SCALE_DOWN_ONLY, SCALE_DOWN_ONLY);
-
-	p = obs_properties_add_list(appearance, S_ALIGNMENT, T_ALIGNMENT, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(p, T_ALIGN_CENTER, "center");
-	obs_property_list_add_string(p, T_ALIGN_TOP_LEFT, "topleft");
-	obs_property_list_add_string(p, T_ALIGN_TOP, "top");
-	obs_property_list_add_string(p, T_ALIGN_TOP_RIGHT, "topright");
-	obs_property_list_add_string(p, T_ALIGN_LEFT, "left");
-	obs_property_list_add_string(p, T_ALIGN_RIGHT, "right");
-	obs_property_list_add_string(p, T_ALIGN_BOTTOM_LEFT, "bottomleft");
-	obs_property_list_add_string(p, T_ALIGN_BOTTOM, "bottom");
-	obs_property_list_add_string(p, T_ALIGN_BOTTOM_RIGHT, "bottomright");
-
-	obs_properties_add_group(props, S_GROUP_APPEARANCE, T_GROUP_APPEARANCE, OBS_GROUP_NORMAL, appearance);
+	si_layout_properties(props);
 
 	return props;
-}
-
-static void missing_file_callback(void *src, const char *new_path, void *data)
-{
-	struct ad_playlist *ap = src;
-	const char *orig_path = data;
-	obs_source_t *source = ap->source;
-	obs_data_t *settings = obs_source_get_settings(source);
-	obs_data_array_t *files = obs_data_get_array(settings, S_FILES);
-	size_t count = obs_data_array_count(files);
-
-	for (size_t i = 0; i < count; i++) {
-		obs_data_t *file = obs_data_array_item(files, i);
-		const char *path = obs_data_get_string(file, "value");
-
-		if (strcmp(path, orig_path) == 0) {
-			if (new_path && *new_path)
-				obs_data_set_string(file, "value", new_path);
-			else
-				obs_data_array_erase(files, i);
-
-			obs_data_release(file);
-			break;
-		}
-
-		obs_data_release(file);
-	}
-
-	obs_source_update(source, settings);
-
-	obs_data_array_release(files);
-	obs_data_release(settings);
 }
 
 static obs_missing_files_t *ap_missing_files(void *data)
 {
 	struct ad_playlist *ap = data;
-	obs_missing_files_t *missing_files = obs_missing_files_create();
-	obs_data_t *settings = obs_source_get_settings(ap->source);
-	obs_data_array_t *files = obs_data_get_array(settings, S_FILES);
-	size_t count = obs_data_array_count(files);
-
-	for (size_t i = 0; i < count; i++) {
-		obs_data_t *item = obs_data_array_item(files, i);
-		const char *path = obs_data_get_string(item, "value");
-
-		if (path && *path && !os_file_exists(path)) {
-			obs_missing_file_t *file = obs_missing_file_create(
-				path, missing_file_callback, OBS_MISSING_FILE_SOURCE, ap->source, (void *)path);
-
-			obs_missing_files_add_file(missing_files, file);
-		}
-
-		obs_data_release(item);
-	}
-
-	obs_data_array_release(files);
-	obs_data_release(settings);
-
-	return missing_files;
+	return si_missing_files(ap->source, &ap->missing_paths);
 }
 
 static enum gs_color_space ap_video_get_color_space(void *data, size_t count,

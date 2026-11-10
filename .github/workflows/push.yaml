@@ -25,6 +25,13 @@ jobs:
     permissions:
       contents: read
 
+  runtime-tests:
+    name: Runtime Tests 🧪
+    if: github.ref_type != 'tag'
+    uses: ./.github/workflows/runtime-tests.yaml
+    permissions:
+      contents: read
+
   create-release:
     name: Create Release 🛫
     if: github.ref_type == 'tag'

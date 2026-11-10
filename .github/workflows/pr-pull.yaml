@@ -25,3 +25,9 @@ jobs:
     secrets: inherit
     permissions:
       contents: read
+
+  runtime-tests:
+    name: Runtime Tests 🧪
+    uses: ./.github/workflows/runtime-tests.yaml
+    permissions:
+      contents: read

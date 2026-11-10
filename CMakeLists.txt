@@ -21,6 +21,10 @@ if(ENABLE_FRONTEND_API)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
 endif()
 
+# The Picture Gallery finds the OBS frontend at runtime (see src/frontend-shim.h)
+# rather than linking it, so the plugin also loads where there is no frontend.
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_DL_LIBS})
+
 if(ENABLE_QT)
   find_package(Qt6 COMPONENTS Widgets Core)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::Core Qt6::Widgets)
@@ -34,6 +38,36 @@ if(ENABLE_QT)
   )
 endif()
 
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c src/ad-playlist-source.c src/ad-playlist-source.h)
+target_sources(
+  ${CMAKE_PROJECT_NAME}
+  PRIVATE
+    src/plugin-main.c
+    src/playlist-common.c
+    src/playlist-common.h
+    src/frontend-shim.c
+    src/frontend-shim.h
+    src/ad-playlist-source.c
+    src/ad-playlist-source.h
+    src/picture-gallery-source.c
+    src/picture-gallery-source.h
+)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+
+# Runtime tests: real libobs, headless under Xvfb. Linux only; see
+# tests/run-runtime-tests.sh.
+option(ENABLE_RUNTIME_TESTS "Build the runtime tests (Linux)" OFF)
+
+if(ENABLE_RUNTIME_TESTS)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "The runtime tests run on Linux only")
+  endif()
+
+  find_package(X11 REQUIRED)
+  find_package(Threads REQUIRED)
+
+  add_executable(runtime-test tests/runtime-test.c)
+  target_link_libraries(runtime-test PRIVATE OBS::libobs X11::X11 Threads::Threads)
+  # the test stands in for the OBS frontend; the plugin finds it with dlsym
+  set_target_properties(runtime-test PROPERTIES ENABLE_EXPORTS ON C_VISIBILITY_PRESET default)
+endif()
