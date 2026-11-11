@@ -618,6 +618,10 @@ static void scenario_nogap(void)
 		      gap);
 	}
 	check(count_translucent(0.0, 0.35) > 0, "fades in from nothing (Show transition)");
+	/* libobs ends a transition with the picture it went to not yet laid
+	 * out - from nothing, not drawn at all for a frame */
+	check(count_color(0.1, 0.7, C_EMPTY) == 0, "no empty frame as the first fade in ends (%zu)",
+	      count_color(0.1, 0.7, C_EMPTY));
 	check(count_color(0.7, 6.0, C_EMPTY) == 0, "never empty once running");
 	check(count_blends(1.2, 6.0) > 0, "images fade into each other");
 	check(count_see_through(1.2, 6.0) > 0, "each image fades out with Hide over the next fading in with Show");
@@ -648,6 +652,9 @@ static void scenario_gap(void)
 		check(count_color(to - 0.75, to, C_EMPTY) >= 8, "empty for the gap before change %zu (%zu samples)", i,
 		      count_color(to - 0.75, to, C_EMPTY));
 		check(count_blends(from, to) == 0, "no image ever blends into the next (%zu)", count_blends(from, to));
+		check(count_color(to + 0.1, to + 1.0, C_EMPTY) == 0,
+		      "no empty frame as change %zu finishes coming in from the gap (%zu)", i,
+		      count_color(to + 0.1, to + 1.0, C_EMPTY));
 	}
 
 	obs_source_release(src);

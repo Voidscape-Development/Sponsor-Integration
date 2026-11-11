@@ -61,6 +61,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <util/platform.h>
 #include <util/darray.h>
 #include <util/dstr.h>
+#include <graphics/matrix4.h>
+#include <graphics/vec2.h>
 
 #include "picture-gallery-source.h"
 #include "playlist-common.h"
@@ -227,6 +229,10 @@ struct pg_slot {
 
 	/* Set by the transition's transition_stop signal. */
 	volatile bool done;
+	/* Also set by transition_stop, and cleared on the next tick: until
+	 * then libobs has not laid out the picture the transition ended on.
+	 * See render_transition(). */
+	volatile bool relayout;
 };
 
 /* a transition that has been replaced, and the slot it was replaced in */
@@ -893,6 +899,7 @@ static void transition_stopped(void *data, calldata_t *cd)
 	struct pg_slot *slot = data;
 
 	UNUSED_PARAMETER(cd);
+	os_atomic_set_bool(&slot->relayout, true);
 	os_atomic_set_bool(&slot->done, true);
 }
 
@@ -1907,6 +1914,136 @@ static void *pg_create(obs_data_t *settings, obs_source_t *source)
 	return pg;
 }
 
+/*
+ * Drawing a transition the frame it ends.
+ *
+ * libobs works out where to draw each of a transition's two pictures when the
+ * transition ticks or starts, and never for a place that is empty. When a
+ * transition ends - during a render - the picture it went to moves into the
+ * first place and is drawn there, with that place's layout, until the next
+ * tick works it out afresh. For a transition that came in from nothing that
+ * layout was never worked out at all and the picture is not drawn: an empty
+ * frame on stream. Between pictures of different sizes it is the old
+ * picture's, and the new one is drawn in the wrong place for a frame.
+ *
+ * So on the frame a transition ends, and on any render after that before it
+ * has ticked again, the gallery draws the picture itself with its layout
+ * worked out now, the way libobs would. libobs still renders the transition,
+ * at no size, so it ends it and reports it as usual.
+ */
+
+/* Where `tr` draws `picture` once it is not transitioning - the same sums as
+ * libobs' recalculate_transition_matrix(). */
+static bool picture_matrix(obs_source_t *tr, obs_source_t *picture, struct matrix4 *mat)
+{
+	enum obs_transition_scale_type type = obs_transition_get_scale_type(tr);
+	uint32_t align = obs_transition_get_alignment(tr);
+	float source_cx = (float)obs_source_get_width(picture);
+	float source_cy = (float)obs_source_get_height(picture);
+	uint32_t cx;
+	uint32_t cy;
+	float tr_cx;
+	float tr_cy;
+	struct vec2 scale = {.x = 1.0f, .y = 1.0f};
+	struct vec2 pos;
+	int space_x;
+	int space_y;
+
+	obs_transition_get_size(tr, &cx, &cy);
+	if (!cx || !cy) {
+		cx = obs_source_get_width(tr);
+		cy = obs_source_get_height(tr);
+	}
+	if (!cx || !cy || source_cx == 0.0f || source_cy == 0.0f)
+		return false;
+
+	tr_cx = (float)cx;
+	tr_cy = (float)cy;
+
+	if (type == OBS_TRANSITION_SCALE_MAX_ONLY && (source_cx > tr_cx || source_cy > tr_cy))
+		type = OBS_TRANSITION_SCALE_ASPECT;
+
+	if (type == OBS_TRANSITION_SCALE_ASPECT) {
+		bool use_width = tr_cx / tr_cy < source_cx / source_cy;
+
+		scale.x = scale.y = use_width ? tr_cx / source_cx : tr_cy / source_cy;
+	} else if (type == OBS_TRANSITION_SCALE_STRETCH) {
+		scale.x = tr_cx / source_cx;
+		scale.y = tr_cy / source_cy;
+	}
+
+	space_x = (int)(tr_cx - source_cx * scale.x);
+	space_y = (int)(tr_cy - source_cy * scale.y);
+
+	vec2_zero(&pos);
+	if (align & OBS_ALIGN_RIGHT)
+		pos.x += (float)space_x;
+	else if ((align & OBS_ALIGN_LEFT) == 0)
+		pos.x += (float)(space_x / 2);
+	if (align & OBS_ALIGN_BOTTOM)
+		pos.y += (float)space_y;
+	else if ((align & OBS_ALIGN_TOP) == 0)
+		pos.y += (float)(space_y / 2);
+
+	matrix4_identity(mat);
+	matrix4_scale3f(mat, mat, scale.x, scale.y, 1.0f);
+	matrix4_translate3f(mat, mat, pos.x, pos.y, 0.0f);
+	return true;
+}
+
+/* Whether `tr` ended since it last ticked. */
+static bool ended_since_tick(struct picture_gallery *pg, obs_source_t *tr)
+{
+	bool ended = false;
+
+	pthread_mutex_lock(&pg->mutex);
+	for (size_t i = 0; i < PG_NUM_SLOTS; i++) {
+		if (pg->slots[i].tr == tr) {
+			ended = os_atomic_load_bool(&pg->slots[i].relayout);
+			break;
+		}
+	}
+	pthread_mutex_unlock(&pg->mutex);
+
+	return ended;
+}
+
+static void render_transition(struct picture_gallery *pg, obs_source_t *tr)
+{
+	bool ending = obs_transition_is_active(tr) && obs_transition_get_time(tr) >= 1.0f;
+	obs_source_t *picture;
+	struct matrix4 mat;
+
+	if (!ending && !ended_since_tick(pg, tr)) {
+		obs_source_video_render(tr);
+		return;
+	}
+
+	if (ending) {
+		gs_matrix_push();
+		gs_matrix_scale3f(0.0f, 0.0f, 1.0f);
+		obs_source_video_render(tr);
+		gs_matrix_pop();
+	}
+
+	/* what it ended on - or, with a stinger's sound still playing past
+	 * the end of the picture, the picture it is going to */
+	picture = obs_transition_get_active_source(tr);
+
+	if (picture && picture_matrix(tr, picture, &mat)) {
+		gs_matrix_push();
+		gs_matrix_mul(&mat);
+		obs_source_video_render(picture);
+		gs_matrix_pop();
+	} else if (!ending) {
+		obs_source_video_render(tr);
+	} else if (picture) {
+		obs_source_video_render(picture);
+	}
+
+	obs_source_release(picture);
+}
+
 static void pg_video_render(void *data, gs_effect_t *effect)
 {
 	struct picture_gallery *pg = data;
@@ -1914,13 +2051,13 @@ static void pg_video_render(void *data, gs_effect_t *effect)
 	obs_source_t *out = get_out_transition(pg);
 
 	if (transition) {
-		obs_source_video_render(transition);
+		render_transition(pg, transition);
 		obs_source_release(transition);
 	}
 
 	/* a picture going out with Hide is drawn over the one coming in */
 	if (out) {
-		obs_source_video_render(out);
+		render_transition(pg, out);
 		obs_source_release(out);
 	}
 
@@ -1938,6 +2075,11 @@ static void pg_video_tick(void *data, float seconds)
 
 	if (pg->out && os_atomic_load_bool(&pg->out->done))
 		drop_out(pg);
+
+	/* every transition is ticked this frame and lays its pictures out
+	 * afresh before anything is rendered */
+	for (size_t i = 0; i < PG_NUM_SLOTS; i++)
+		os_atomic_set_bool(&pg->slots[i].relayout, false);
 
 	pg->size_timer += seconds;
 	if (pg->size_timer >= SIZE_UPDATE_INTERVAL) {
