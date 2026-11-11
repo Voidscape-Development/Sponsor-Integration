@@ -62,7 +62,7 @@ fi
 
 scenarios=("$@")
 if [[ ${#scenarios[@]} -eq 0 ]]; then
-  scenarios=(nogap gap wrap end controls hidden_restart retype hammer scene stinger ad_playlist missing_files)
+  scenarios=(nogap gap show_none show_hide_none all_none edges_only wrap end controls hidden_restart retype hammer scene stinger ad_playlist missing_files)
 fi
 
 failed=()

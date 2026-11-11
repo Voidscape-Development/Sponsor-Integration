@@ -209,6 +209,11 @@ static void sample(obs_source_t *source)
 			gs_texrender_end(texrender);
 		}
 
+		/* Stamped once rendered: getting into the graphics context
+		 * can wait out a slow frame, and the picture is the one at
+		 * this moment, not at the call. */
+		s.t = now();
+
 		gs_stage_texture(stagesurf, gs_texrender_get_texture(texrender));
 		if (gs_stagesurface_map(stagesurf, &data, &linesize)) {
 			uint8_t *px = data + (cy / 2) * linesize + (cx / 2) * 4;
@@ -351,6 +356,45 @@ static size_t count_translucent(double from, double to)
 	return n;
 }
 
+/* samples drawn but not fully opaque - two images each fading on their own,
+ * rather than one crossfade between them, which stays opaque */
+static size_t count_see_through(double from, double to)
+{
+	size_t n = 0;
+
+	for (size_t i = 0; i < samples.num; i++) {
+		struct sample *s = &samples.array[i];
+
+		if (s->t >= from && s->t < to && s->c != C_NONE && s->a >= 10 && s->a < 245)
+			n++;
+	}
+
+	return n;
+}
+
+/* Prints what was recorded between `from` and `to`, for a check that failed
+ * somewhere it cannot be reproduced. */
+static void dump(double from, double to)
+{
+	for (size_t i = 0; i < events.num; i++) {
+		struct event *e = &events.array[i];
+
+		if (e->t >= from && e->t < to)
+			printf("%6.2f  event %s %lld %s\n", e->t,
+			       e->kind == EV_CHANGED ? "changed"
+			       : e->kind == EV_ENDED ? "ended"
+						     : "mark",
+			       e->index, e->what);
+	}
+	for (size_t i = 0; i < samples.num; i++) {
+		struct sample *s = &samples.array[i];
+
+		if (s->t >= from && s->t < to)
+			printf("%6.2f  pixel %-5s r%3d g%3d b%3d a%3d\n", s->t, color_names[s->c], s->r, s->g, s->b,
+			       s->a);
+	}
+}
+
 static enum color last_color(void)
 {
 	return samples.num ? samples.array[samples.num - 1].c : C_NONE;
@@ -485,6 +529,61 @@ static bool start_obs(const char *plugin, const char *plugin_data)
 	return true;
 }
 
+/*
+ * Draws each built-in transition a few times, offscreen, before any scenario
+ * runs. A software renderer compiles a shader the first time it draws with it,
+ * and on CI's runners that holds the first frame of a fade for most of a
+ * second - longer than the fade - so a scenario's first fade could never be
+ * seen.
+ */
+static void warm_up_transitions(void)
+{
+	static const char *ids[] = {"fade_transition", "fade_to_color_transition", "swipe_transition",
+				    "slide_transition"};
+	obs_data_t *image_settings = obs_data_create();
+	struct dstr path = {0};
+	obs_source_t *image;
+
+	dstr_printf(&path, "%s/1_red.png", image_dir);
+	obs_data_set_string(image_settings, "file", path.array);
+	image = obs_source_create_private("image_source", NULL, image_settings);
+	obs_data_release(image_settings);
+	dstr_free(&path);
+
+	/* drawn with a picture, so the image's own drawing is compiled too */
+	for (int i = 0; i < 100 && image && !obs_source_get_width(image); i++)
+		os_sleep_ms(10);
+
+	for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+		obs_source_t *tr = obs_source_create_private(ids[i], NULL, NULL);
+
+		if (!tr)
+			continue;
+
+		obs_transition_set_size(tr, 64, 36);
+		obs_transition_start(tr, OBS_TRANSITION_MODE_AUTO, 200, image);
+
+		for (int frame = 0; frame < 3; frame++) {
+			obs_enter_graphics();
+			if (!texrender)
+				texrender = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+			gs_texrender_reset(texrender);
+			if (gs_texrender_begin(texrender, 64, 36)) {
+				gs_ortho(0.0f, 64.0f, 0.0f, 36.0f, -100.0f, 100.0f);
+				obs_source_video_render(tr);
+				gs_texrender_end(texrender);
+			}
+			obs_leave_graphics();
+			os_sleep_ms(20);
+		}
+
+		obs_transition_clear(tr);
+		obs_source_release(tr);
+	}
+
+	obs_source_release(image);
+}
+
 static obs_data_t *gallery_settings(void)
 {
 	obs_data_t *s = obs_data_create();
@@ -505,6 +604,36 @@ static obs_data_t *gallery_settings(void)
 	return s;
 }
 
+static void count_child(obs_source_t *parent, obs_source_t *child, void *param)
+{
+	(void)parent;
+	(void)child;
+	(*(size_t *)param)++;
+}
+
+/*
+ * Lets a new source load before it goes on screen, as sources do in OBS. Its
+ * first update runs on the graphics thread's next tick and sets up its
+ * transitions, which can hold that thread for a good fraction of a second on
+ * a software renderer; on screen at once, the source's first transition would
+ * run out while nothing could be sampled.
+ */
+static void wait_until_loaded(obs_source_t *source)
+{
+	for (int i = 0; i < 200; i++) {
+		size_t children = 0;
+
+		obs_source_enum_active_sources(source, count_child, &children);
+		if (children)
+			break;
+		os_sleep_ms(10);
+	}
+
+	/* and the frame that did it has finished */
+	obs_enter_graphics();
+	obs_leave_graphics();
+}
+
 /* Creates the source and puts it on the program output, so it is showing,
  * ticking and rendering as it would on stream. */
 static obs_source_t *start_source(const char *id, obs_data_t *settings, const char *changed_signal,
@@ -523,6 +652,8 @@ static obs_source_t *start_source(const char *id, obs_data_t *settings, const ch
 	sh = obs_source_get_signal_handler(source);
 	signal_handler_connect(sh, changed_signal, on_changed, NULL);
 	signal_handler_connect(sh, ended_signal, on_ended, NULL);
+
+	wait_until_loaded(source);
 
 	scene = obs_scene_create("test scene");
 	obs_scene_add(scene, source);
@@ -583,7 +714,8 @@ static void update_string(obs_source_t *source, const char *key, const char *val
 /* scenarios                                                                  */
 
 /* No gap: the first image comes in from nothing, then each image is up for
- * the hold time plus the transition, never leaving an empty frame. */
+ * the hold time plus the transition, never leaving an empty frame - each one
+ * goes out with Hide over the next coming in with Show. */
 static void scenario_nogap(void)
 {
 	obs_source_t *src = start_gallery(gallery_settings());
@@ -601,8 +733,15 @@ static void scenario_nogap(void)
 		      gap);
 	}
 	check(count_translucent(0.0, 0.35) > 0, "fades in from nothing (Show transition)");
+	if (!count_translucent(0.0, 0.35))
+		dump(0.0, 0.7);
+	/* libobs ends a transition with the picture it went to not yet laid
+	 * out - from nothing, not drawn at all for a frame */
+	check(count_color(0.1, 0.7, C_EMPTY) == 0, "no empty frame as the first fade in ends (%zu)",
+	      count_color(0.1, 0.7, C_EMPTY));
 	check(count_color(0.7, 6.0, C_EMPTY) == 0, "never empty once running");
 	check(count_blends(1.2, 6.0) > 0, "images fade into each other");
+	check(count_see_through(1.2, 6.0) > 0, "each image fades out with Hide over the next fading in with Show");
 
 	obs_source_release(src);
 }
@@ -630,19 +769,106 @@ static void scenario_gap(void)
 		check(count_color(to - 0.75, to, C_EMPTY) >= 8, "empty for the gap before change %zu (%zu samples)", i,
 		      count_color(to - 0.75, to, C_EMPTY));
 		check(count_blends(from, to) == 0, "no image ever blends into the next (%zu)", count_blends(from, to));
+		check(count_color(to + 0.1, to + 1.0, C_EMPTY) == 0,
+		      "no empty frame as change %zu finishes coming in from the gap (%zu)", i,
+		      count_color(to + 0.1, to + 1.0, C_EMPTY));
 	}
 
 	obs_source_release(src);
 }
 
+/* Show set to None: the next image is there at once, underneath the last one
+ * going out with Hide - never translucent, never empty. */
+static void scenario_show_none(void)
+{
+	obs_data_t *s = gallery_settings();
+	obs_source_t *src;
+
+	obs_data_set_string(s, "show_transition", "none");
+	src = start_gallery(s);
+
+	run(src, 5.0, NULL);
+
+	check(count_changes() >= 3, "at least 3 images in 5 s (%zu)", count_changes());
+	check(count_color(0.7, 5.0, C_EMPTY) == 0, "never empty once running");
+	check(count_translucent(0.7, 5.0) == 0, "the next image is fully there underneath (%zu translucent)",
+	      count_translucent(0.7, 5.0));
+	check(count_blends(1.0, 5.0) > 0, "the last image fades out over the next (Hide)");
+
+	obs_source_release(src);
+}
+
+/* Show and Hide both None: the Normal transition goes from image to image. */
+static void scenario_show_hide_none(void)
+{
+	obs_data_t *s = gallery_settings();
+	obs_source_t *src;
+
+	obs_data_set_string(s, "show_transition", "none");
+	obs_data_set_string(s, "hide_transition", "none");
+	obs_data_set_string(s, "normal_transition", "fade_to_color");
+	src = start_gallery(s);
+
+	run(src, 5.0, NULL);
+
+	check(count_changes() >= 3, "at least 3 images in 5 s (%zu)", count_changes());
+	check(count_color(1.2, 5.0, C_BLACK) > 0, "the Normal fade to color plays between images");
+	check(count_blends(1.2, 5.0) == 0, "no Show/Hide blend (%zu)", count_blends(1.2, 5.0));
+
+	obs_source_release(src);
+}
+
+/* Everything None: plain cuts. */
+static void scenario_all_none(void)
+{
+	obs_data_t *s = gallery_settings();
+	obs_source_t *src;
+
+	obs_data_set_string(s, "show_transition", "none");
+	obs_data_set_string(s, "hide_transition", "none");
+	obs_data_set_string(s, "normal_transition", "none");
+	src = start_gallery(s);
+
+	run(src, 4.0, NULL);
+
+	check(count_changes() >= 3, "at least 3 images in 4 s (%zu)", count_changes());
+	check(count_color(0.3, 4.0, C_EMPTY) == 0, "never empty");
+	check(count_color(0.3, 4.0, C_MIX) == 0, "cuts from image to image (%zu mixed)", count_color(0.3, 4.0, C_MIX));
+
+	obs_source_release(src);
+}
+
+/* Show/Hide only at the edges: images change with the Normal transition. */
+static void scenario_edges_only(void)
+{
+	obs_data_t *s = gallery_settings();
+	obs_source_t *src;
+
+	obs_data_set_bool(s, "show_hide_edges_only", true);
+	obs_data_set_string(s, "normal_transition", "fade_to_color");
+	src = start_gallery(s);
+
+	run(src, 5.0, NULL);
+
+	check(count_changes() >= 3, "at least 3 images in 5 s (%zu)", count_changes());
+	check(count_translucent(0.0, 0.35) > 0, "fades in from nothing (Show transition)");
+	check(count_color(1.2, 5.0, C_BLACK) > 0, "the Normal fade to color plays between images");
+	check(count_blends(1.2, 5.0) == 0, "no Show/Hide between images (%zu)", count_blends(1.2, 5.0));
+	check(count_see_through(1.2, 5.0) == 0, "no image fades out on its own between images");
+
+	obs_source_release(src);
+}
+
 /* A Loop wrap transition of its own: a cut at the loop point, fades
- * elsewhere. */
+ * elsewhere (with Show/Hide only at the edges, so the wrap replaces the Normal
+ * transition). */
 static void scenario_wrap(void)
 {
 	obs_data_t *s = gallery_settings();
 	obs_source_t *src;
 	struct event *wrap;
 
+	obs_data_set_bool(s, "show_hide_edges_only", true);
 	obs_data_set_string(s, "wrap_transition", "cut");
 	src = start_gallery(s);
 
@@ -819,8 +1045,13 @@ static void retype_steps(obs_source_t *src, double t, int *step)
 
 static void scenario_retype(void)
 {
-	obs_source_t *src = start_gallery(gallery_settings());
+	obs_data_t *s = gallery_settings();
+	obs_source_t *src;
 	size_t before;
+
+	/* the Normal transition is the one on screen */
+	obs_data_set_bool(s, "show_hide_edges_only", true);
+	src = start_gallery(s);
 
 	run(src, 2.1, retype_steps);
 	before = count_changes();
@@ -850,16 +1081,18 @@ static pthread_mutex_t hammer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static void *hammer(void *data)
 {
 	obs_source_t *src = data;
-	static const char *types[] = {"fade", "cut", "swipe", "slide", "fade_to_color", "same"};
+	static const char *types[] = {"fade", "cut", "swipe", "slide", "fade_to_color", "none", "same"};
 	unsigned seed = (unsigned)(uintptr_t)pthread_self();
 
 	while (os_atomic_load_bool(&hammering)) {
 		obs_data_t *s = obs_data_create();
 		int which = rand_r(&seed);
 
-		obs_data_set_string(s, "normal_transition", types[which % 5]);
-		obs_data_set_string(s, "wrap_transition", types[(which >> 4) % 6]);
-		obs_data_set_string(s, "hide_transition", types[(which >> 8) % 5]);
+		obs_data_set_string(s, "normal_transition", types[which % 6]);
+		obs_data_set_string(s, "wrap_transition", types[(which >> 4) % 7]);
+		obs_data_set_string(s, "hide_transition", types[(which >> 8) % 6]);
+		obs_data_set_string(s, "show_transition", types[(which >> 24) % 6]);
+		obs_data_set_bool(s, "show_hide_edges_only", (which >> 27) % 2);
 		obs_data_set_int(s, "normal_duration", 100 + (which >> 12) % 300);
 		obs_data_set_int(s, "gap_time", (which >> 16) % 2 ? 0 : 200);
 		obs_data_set_bool(s, "shuffle", (which >> 18) % 2);
@@ -914,6 +1147,9 @@ static void scenario_hammer(void)
 	s = gallery_settings();
 	obs_data_set_string(s, "normal_transition", "fade");
 	obs_data_set_string(s, "wrap_transition", "same");
+	obs_data_set_string(s, "show_transition", "fade");
+	obs_data_set_string(s, "hide_transition", "fade");
+	obs_data_set_bool(s, "show_hide_edges_only", false);
 	obs_data_set_int(s, "gap_time", 0);
 	obs_data_set_bool(s, "shuffle", false);
 	obs_source_update(src, s);
@@ -975,6 +1211,7 @@ static void scenario_scene(void)
 	obs_data_set_int(tint_settings, "color", 0xFFFFFFFF);
 	obs_data_set_int(tint_settings, "switch_point", 50);
 
+	obs_data_set_bool(s, "show_hide_edges_only", true);
 	obs_data_set_string(s, "normal_transition", "scene");
 	obs_data_set_string(s, "normal_scene_transition", "Tint");
 	obs_data_set_int(s, "normal_duration", 600);
@@ -1015,6 +1252,7 @@ static void scenario_stinger(void)
 		return;
 	}
 
+	obs_data_set_bool(s, "show_hide_edges_only", true);
 	obs_data_set_string(s, "normal_transition", "stinger");
 	obs_data_set_string(s, "normal_stinger_path", stinger_path);
 	obs_data_set_int(s, "normal_stinger_transition_point", 500);
@@ -1129,6 +1367,10 @@ struct scenario {
 static const struct scenario scenarios[] = {
 	{"nogap", scenario_nogap},
 	{"gap", scenario_gap},
+	{"show_none", scenario_show_none},
+	{"show_hide_none", scenario_show_hide_none},
+	{"all_none", scenario_all_none},
+	{"edges_only", scenario_edges_only},
 	{"wrap", scenario_wrap},
 	{"end", scenario_end},
 	{"controls", scenario_controls},
@@ -1172,6 +1414,8 @@ int main(int argc, char **argv)
 		fprintf(stderr, "could not start libobs\n");
 		return 2;
 	}
+
+	warm_up_transitions();
 
 	printf("== %s\n", scenario->name);
 	t0 = os_gettime_ns();
