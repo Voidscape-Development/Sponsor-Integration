@@ -367,6 +367,29 @@ static size_t count_see_through(double from, double to)
 	return n;
 }
 
+/* Prints what was recorded between `from` and `to`, for a check that failed
+ * somewhere it cannot be reproduced. */
+static void dump(double from, double to)
+{
+	for (size_t i = 0; i < events.num; i++) {
+		struct event *e = &events.array[i];
+
+		if (e->t >= from && e->t < to)
+			printf("%6.2f  event %s %lld %s\n", e->t,
+			       e->kind == EV_CHANGED ? "changed"
+			       : e->kind == EV_ENDED ? "ended"
+						     : "mark",
+			       e->index, e->what);
+	}
+	for (size_t i = 0; i < samples.num; i++) {
+		struct sample *s = &samples.array[i];
+
+		if (s->t >= from && s->t < to)
+			printf("%6.2f  pixel %-5s r%3d g%3d b%3d a%3d\n", s->t, color_names[s->c], s->r, s->g, s->b,
+			       s->a);
+	}
+}
+
 static enum color last_color(void)
 {
 	return samples.num ? samples.array[samples.num - 1].c : C_NONE;
@@ -618,6 +641,8 @@ static void scenario_nogap(void)
 		      gap);
 	}
 	check(count_translucent(0.0, 0.35) > 0, "fades in from nothing (Show transition)");
+	if (!count_translucent(0.0, 0.35))
+		dump(0.0, 0.7);
 	/* libobs ends a transition with the picture it went to not yet laid
 	 * out - from nothing, not drawn at all for a frame */
 	check(count_color(0.1, 0.7, C_EMPTY) == 0, "no empty frame as the first fade in ends (%zu)",
