@@ -22,20 +22,32 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * A rotation of still (or animated) images with a separate transition for
  * each "direction" the gallery can move in:
  *
- *   Normal     image -> image
- *   Show       nothing -> image   (the gallery comes in)
- *   Hide       image -> nothing   (the gallery goes out)
- *   Loop wrap  last image -> first image
+ *   Show       brings a picture in
+ *   Hide       takes a picture out
+ *   Normal     image -> image, when Show and Hide are not used
+ *   Loop wrap  brings the first image in again at the loop point
  *
- * and an optional gap between images: with a gap set, every change goes out
- * to nothing with the Hide transition, holds empty for the gap, and comes back
- * in with the Show transition (the Loop wrap transition, when it has one of
- * its own, brings the first image back in after the gap at the loop point).
+ * By default every picture comes in with the Show transition and goes out with
+ * the Hide transition. With no gap the two run at once: the outgoing picture
+ * plays Hide on top (the `out` layer) while the next one plays Show
+ * underneath. With a gap the picture goes out with Hide, the gallery holds
+ * empty for the gap, and the next comes in with Show.
  *
- * Each direction owns a private transition source of its own. Only one of them
- * is on screen at a time - `cur` - and when the gallery moves to a different
- * direction, whatever the current one shows is handed over to the next one
- * before it starts, so the new transition starts from the right picture.
+ * Any direction can be set to None. None for Show and Hide means the picture
+ * just appears or disappears around the other one; with both None the Normal
+ * transition goes straight from one image to the next. Whenever the gallery
+ * has to come in from or go out to nothing and the direction is None, the
+ * Normal transition stands in for it.
+ *
+ * "Show/Hide only at the edges" keeps the older behaviour, which is also how
+ * the Source Switcher plugin behaves: Normal between images, and Show/Hide only
+ * when the gallery comes in from or goes out to nothing (including the gap).
+ *
+ * Each direction owns a private transition source of its own (a cut for a
+ * direction set to None). One of them is the base on screen - `cur` - and when
+ * the gallery moves to a different direction, whatever the current one shows
+ * is handed over to the next one before it starts, so the new transition
+ * starts from the right picture.
  *
  * Every direction can use one of the built-in transitions or one of the scene
  * transitions configured in OBS (when running inside the OBS UI). A scene
@@ -69,6 +81,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define S_SHUFFLE                      "shuffle"
 #define S_HIDE_DONE                    "hide_when_done"
 #define S_RESTART_ON_SHOW              "restart_on_show"
+#define S_EDGES_ONLY                   "show_hide_edges_only"
 
 #define S_GROUP_PLAYBACK               "playback_group"
 
@@ -85,6 +98,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define SS_STINGER_HW                  "stinger_hw_decode"
 #define SS_GROUP                       "group"
 
+#define TR_NONE                        "none"
+/* what "None" for Loop wrap used to be stored as */
 #define TR_SAME                        "same"
 #define TR_SCENE                       "scene"
 
@@ -99,11 +114,13 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define T_SHUFFLE                      T_("Shuffle")
 #define T_HIDE_DONE                    T_("HideWhenDone")
 #define T_RESTART_ON_SHOW              T_("RestartOnShow")
+#define T_EDGES_ONLY                   T_("EdgesOnly")
+#define T_EDGES_ONLY_DESC              T_("EdgesOnly.Desc")
 
 #define T_GROUP_PLAYBACK               T_("Group.Playback")
 
 #define T_TR_TYPE                      T_("Transition")
-#define T_TR_SAME                      T_("Transition.Same")
+#define T_TR_NONE                      T_("Transition.None")
 #define T_TR_SCENE                     T_("Transition.Scene")
 #define T_TR_SCENE_NAME                T_("Transition.SceneName")
 #define T_TR_SCENE_NAME_DESC           T_("Transition.SceneName.Desc")
@@ -155,8 +172,6 @@ struct pg_slot_desc {
 	const char *group_desc;
 	const char *default_type;
 	uint32_t default_duration;
-	/* whether "Same as the normal transition" is offered */
-	bool allow_same;
 };
 
 /* clang-format off */
@@ -180,10 +195,10 @@ static const struct si_tr_keys slot_tr_keys[PG_NUM_SLOTS] = {
 /* clang-format on */
 
 static const struct pg_slot_desc slot_desc[PG_NUM_SLOTS] = {
-	{"normal", "Group.Normal", "Group.Normal.Desc", SI_TR_FADE, 500, false},
-	{"show", "Group.Show", "Group.Show.Desc", SI_TR_FADE, 500, false},
-	{"hide", "Group.Hide", "Group.Hide.Desc", SI_TR_FADE, 500, false},
-	{"wrap", "Group.Wrap", "Group.Wrap.Desc", TR_SAME, 500, true},
+	{"normal", "Group.Normal", "Group.Normal.Desc", SI_TR_FADE, 500},
+	{"show", "Group.Show", "Group.Show.Desc", SI_TR_FADE, 500},
+	{"hide", "Group.Hide", "Group.Hide.Desc", SI_TR_FADE, 500},
+	{"wrap", "Group.Wrap", "Group.Wrap.Desc", TR_NONE, 500},
 };
 
 struct picture_gallery;
@@ -193,15 +208,16 @@ struct pg_slot {
 	struct picture_gallery *pg;
 	enum pg_slot_id id;
 
-	/* The private transition this direction plays. NULL while it is set to
-	 * "same as normal". Owned; written by update() under the mutex. */
+	/* The private transition this direction plays - a cut while it is set
+	 * to None. Owned; written by update() under the mutex. */
 	obs_source_t *tr;
 	/* the libobs id `tr` was created as */
 	char *tr_id;
 	/* what `tr`'s settings were last built from, to skip no-op updates */
 	char *sig;
 
-	bool use_normal;
+	/* set to None: not used where another direction can stand in */
+	bool none;
 	bool cut;
 	uint32_t duration_ms;
 
@@ -264,6 +280,8 @@ struct picture_gallery {
 	bool shuffle;
 	bool hide_when_done;
 	bool restart_on_show;
+	/* Show/Hide only when the gallery comes in from or goes out to nothing */
+	bool edges_only;
 
 	si_path_array_t configured_paths;
 
@@ -271,6 +289,9 @@ struct picture_gallery {
 	struct pg_slot slots[PG_NUM_SLOTS];
 	/* the slot on screen, NULL before the first image is shown */
 	struct pg_slot *cur;
+	/* The Hide slot while it takes the previous picture out on top of `cur`
+	 * bringing the next one in, NULL otherwise. See swap_picture(). */
+	struct pg_slot *out;
 
 	/* The transition that was on screen before `cur` took over, still drawn
 	 * in its place for a couple of ticks - see trail_previous(). A
@@ -526,6 +547,16 @@ static const char *slot_key(char *buf, size_t size, enum pg_slot_id id, const ch
 	return buf;
 }
 
+/* Whether a direction's transition type means None. Loop wrap's None used to
+ * be "same as the normal transition", which is what None does there. */
+static bool is_none_type(enum pg_slot_id id, const char *type)
+{
+	if (astrcmpi(type, TR_NONE) == 0 || astrcmpi(type, TR_SAME) == 0)
+		return true;
+
+	return id == PG_SLOT_WRAP && !*type;
+}
+
 static inline void set_media_state(struct picture_gallery *pg, enum obs_media_state state)
 {
 	pg->state = state;
@@ -541,6 +572,19 @@ static obs_source_t *get_current_transition(struct picture_gallery *pg)
 		tr = obs_source_get_ref(pg->trail_tr);
 	else if (pg->cur)
 		tr = obs_source_get_ref(pg->cur->tr);
+	pthread_mutex_unlock(&pg->mutex);
+
+	return tr;
+}
+
+/* The Hide transition drawn on top while it takes a picture out, if any. */
+static obs_source_t *get_out_transition(struct picture_gallery *pg)
+{
+	obs_source_t *tr = NULL;
+
+	pthread_mutex_lock(&pg->mutex);
+	if (pg->out)
+		tr = obs_source_get_ref(pg->out->tr);
 	pthread_mutex_unlock(&pg->mutex);
 
 	return tr;
@@ -666,16 +710,40 @@ static bool move_position(struct picture_gallery *pg, bool forward)
 /* ------------------------------------------------------------------------- */
 /* transitions                                                                */
 
-/* The slot that actually plays for direction `id`: the Loop wrap direction
- * may borrow the normal one. Mutex must be held. */
+/* The slot that actually plays for direction `id`: a direction set to None
+ * borrows the normal one (and a Normal set to None is a cut). Mutex must be
+ * held. */
 static struct pg_slot *resolve_slot(struct picture_gallery *pg, enum pg_slot_id id)
 {
 	struct pg_slot *slot = &pg->slots[id];
 
-	if (!slot->tr || slot->use_normal)
+	if (!slot->tr || slot->none)
 		slot = &pg->slots[PG_SLOT_NORMAL];
 
 	return slot->tr ? slot : NULL;
+}
+
+/* Whether direction `id` is set to a transition of its own. Mutex must be
+ * held. */
+static inline bool slot_used(struct picture_gallery *pg, enum pg_slot_id id)
+{
+	return pg->slots[id].tr && !pg->slots[id].none;
+}
+
+/* Stops drawing the Hide transition that was taking a picture out on top.
+ * Mutex must be held. */
+static void drop_out(struct picture_gallery *pg)
+{
+	struct pg_slot *out = pg->out;
+
+	if (!out)
+		return;
+
+	pg->out = NULL;
+	os_atomic_set_bool(&out->done, true);
+
+	if (out != pg->cur && out->tr)
+		obs_transition_clear(out->tr);
 }
 
 /*
@@ -770,6 +838,9 @@ static void run_transition(struct picture_gallery *pg, enum pg_slot_id id, obs_s
 	if (!slot)
 		return;
 
+	/* whatever was still going out on top is gone the moment the gallery
+	 * moves on again */
+	drop_out(pg);
 	switch_to_slot(pg, slot);
 
 	os_atomic_set_bool(&slot->done, false);
@@ -876,6 +947,73 @@ static void bring_in(struct picture_gallery *pg, enum pg_slot_id id)
 	signal_image_changed(pg, item);
 }
 
+/*
+ * Swap the picture on screen for the current image, each with its own
+ * transition at the same time: the picture on screen goes out with Hide, drawn
+ * on top, while the current image comes in from nothing with `in_id` (Show or
+ * Loop wrap) underneath.
+ *
+ * With Hide set to None there is nothing to take the old picture out, so the
+ * incoming transition plays straight from it instead (with Show set to None as
+ * well, that is the Normal transition). With Show set to None and Hide used,
+ * the new image is simply there underneath as the old one goes out on top.
+ *
+ * Mutex must be held.
+ */
+static void swap_picture(struct picture_gallery *pg, enum pg_slot_id in_id)
+{
+	struct pg_item *item = current_item(pg);
+	struct pg_slot *hide = &pg->slots[PG_SLOT_HIDE];
+	struct pg_slot *in = &pg->slots[in_id];
+	obs_source_t *showing = NULL;
+
+	if (!item)
+		return;
+
+	if (pg->cur && pg->cur->tr)
+		showing = obs_transition_get_active_source(pg->cur->tr);
+
+	/* Nothing to take out, the same picture again, or Hide not used:
+	 * one transition from the picture on screen. */
+	if (!showing || showing == item->source || !slot_used(pg, PG_SLOT_HIDE) || !in->tr) {
+		obs_source_release(showing);
+		bring_in(pg, in_id);
+		return;
+	}
+
+	drop_out(pg);
+	end_trail(pg);
+
+	/* the slot holding the picture lets go of it, unless it is one of the
+	 * two about to play */
+	if (pg->cur && pg->cur != hide && pg->cur != in)
+		obs_transition_clear(pg->cur->tr);
+
+	/* out with Hide, on top */
+	obs_transition_set(hide->tr, showing);
+	if (!hide->cut && obs_transition_start(hide->tr, OBS_TRANSITION_MODE_AUTO, hide->duration_ms, NULL)) {
+		os_atomic_set_bool(&hide->done, false);
+		pg->out = hide;
+	} else {
+		obs_transition_set(hide->tr, NULL);
+		os_atomic_set_bool(&hide->done, true);
+	}
+	obs_source_release(showing);
+
+	/* in from nothing, underneath */
+	pg->cur = in;
+	os_atomic_set_bool(&in->done, false);
+	obs_transition_set(in->tr, NULL);
+	if (in->cut || !obs_transition_start(in->tr, OBS_TRANSITION_MODE_AUTO, in->duration_ms, item->source)) {
+		obs_transition_set(in->tr, item->source);
+		os_atomic_set_bool(&in->done, true);
+	}
+
+	pg->on_screen = true;
+	enter_phase(pg, PG_IN);
+	signal_image_changed(pg, item);
+}
+
 /* Take the gallery out to nothing with the Hide transition. Mutex must be
  * held. */
 static void take_out(struct picture_gallery *pg, enum pg_after_out after)
@@ -900,6 +1038,7 @@ static void take_out(struct picture_gallery *pg, enum pg_after_out after)
  * held. */
 static void clear_now(struct picture_gallery *pg)
 {
+	drop_out(pg);
 	end_trail(pg);
 
 	if (pg->cur && pg->cur->tr) {
@@ -911,14 +1050,20 @@ static void clear_now(struct picture_gallery *pg)
 	enter_phase(pg, PG_IDLE);
 }
 
-/* Bring the current image in, from wherever the gallery is: with the normal
- * transition if a picture is up, with the Show transition if it is empty.
+/* Bring the current image in, from wherever the gallery is: with the Show
+ * transition if it is empty, and if a picture is up, by swapping it out (or
+ * with the Normal transition when Show/Hide are only used at the edges).
  * Mutex must be held. */
 static void bring_in_from_anywhere(struct picture_gallery *pg)
 {
 	bool picture_up = pg->on_screen && pg->phase != PG_OUT;
 
-	bring_in(pg, picture_up ? PG_SLOT_NORMAL : PG_SLOT_SHOW);
+	if (!picture_up)
+		bring_in(pg, PG_SLOT_SHOW);
+	else if (pg->edges_only)
+		bring_in(pg, PG_SLOT_NORMAL);
+	else
+		swap_picture(pg, PG_SLOT_SHOW);
 }
 
 static void gallery_finished(struct picture_gallery *pg)
@@ -944,6 +1089,7 @@ static void gallery_finished(struct picture_gallery *pg)
 /* The current image's hold time ran out. Mutex must be held. */
 static void advance_auto(struct picture_gallery *pg)
 {
+	enum pg_slot_id in_id;
 	bool wrapped;
 
 	if (!pg->loop && pg->order_pos + 1 >= pg->order.num) {
@@ -953,15 +1099,17 @@ static void advance_auto(struct picture_gallery *pg)
 
 	wrapped = move_position(pg, true);
 
-	if (pg->gap_time > 0.0f) {
-		/* after the gap a wrap comes in with the Loop wrap transition
-		 * when it has one of its own, everything else with Show */
-		bool own_wrap = pg->slots[PG_SLOT_WRAP].tr && !pg->slots[PG_SLOT_WRAP].use_normal;
+	/* a wrap comes in with the Loop wrap transition when it has one of its
+	 * own, everything else with Show */
+	in_id = wrapped && slot_used(pg, PG_SLOT_WRAP) ? PG_SLOT_WRAP : PG_SLOT_SHOW;
 
-		pg->gap_in = wrapped && own_wrap ? PG_SLOT_WRAP : PG_SLOT_SHOW;
+	if (pg->gap_time > 0.0f) {
+		pg->gap_in = in_id;
 		take_out(pg, PG_AFTER_GAP);
-	} else {
+	} else if (pg->edges_only) {
 		bring_in(pg, wrapped ? PG_SLOT_WRAP : PG_SLOT_NORMAL);
+	} else {
+		swap_picture(pg, in_id);
 	}
 }
 
@@ -1186,48 +1334,19 @@ static void update_slot(struct picture_gallery *pg, struct pg_slot *slot, obs_da
 	const char *tr_id;
 	struct dstr sig = {0};
 	bool is_cut = false;
+	bool none = is_none_type(id, type);
 	bool settings_moved;
-
-	/* ---- "same as normal" ---- */
-
-	if (slot_desc[id].allow_same && (!*type || astrcmpi(type, TR_SAME) == 0)) {
-		watch_scene_transition(slot, NULL);
-
-		pthread_mutex_lock(&pg->mutex);
-		slot->use_normal = true;
-		if (slot->tr) {
-			old_tr = slot->tr;
-
-			if (pg->cur == slot && pg->slots[PG_SLOT_NORMAL].tr) {
-				/* The normal transition takes the picture over and
-				 * this one trails it. The trail holds a reference of
-				 * its own; it takes over the slot's instead and
-				 * retires the transition when it ends. */
-				switch_to_slot(pg, &pg->slots[PG_SLOT_NORMAL]);
-				if (pg->trail_tr == old_tr) {
-					obs_source_release(pg->trail_tr);
-					pg->trail_retired = slot;
-					old_tr = NULL;
-				}
-			} else if (pg->cur == slot) {
-				pg->cur = NULL;
-			}
-
-			slot->tr = NULL;
-		}
-		pthread_mutex_unlock(&pg->mutex);
-
-		retire_transition(pg, slot, old_tr, false);
-		bfree(slot->tr_id);
-		slot->tr_id = NULL;
-		bfree(slot->sig);
-		slot->sig = NULL;
-		return;
-	}
 
 	/* ---- which transition, with which settings ---- */
 
-	if (astrcmpi(type, TR_SCENE) == 0) {
+	if (none) {
+		/* Not used: a cut that only ever plays where nothing else can
+		 * stand in for it, and that keeps a picture on screen. */
+		tr_id = "cut_transition";
+		tr_settings = obs_data_create();
+		is_cut = true;
+		dstr_printf(&sig, "none|");
+	} else if (astrcmpi(type, TR_SCENE) == 0) {
 		const char *name = obs_data_get_string(settings, slot_key(key, sizeof(key), id, SS_SCENE));
 
 		scene = st_find(name);
@@ -1283,12 +1402,18 @@ static void update_slot(struct picture_gallery *pg, struct pg_slot *slot, obs_da
 
 	pthread_mutex_lock(&pg->mutex);
 
-	slot->use_normal = false;
+	slot->none = none;
 	slot->cut = is_cut;
 	slot->duration_ms = (uint32_t)obs_data_get_int(settings, slot_key(key, sizeof(key), id, SS_DURATION));
 
 	if (new_tr) {
 		old_tr = slot->tr;
+
+		/* a Hide on its way out on top is not carried over */
+		if (pg->out == slot) {
+			pg->out = NULL;
+			os_atomic_set_bool(&slot->done, true);
+		}
 
 		/* the slot on screen keeps its picture across the swap, and the
 		 * old transition stays up until the new one is laid out */
@@ -1350,6 +1475,11 @@ static void pg_update(void *data, obs_data_t *settings)
 	da_init(paths);
 	da_init(files);
 
+	/* Loop wrap's "same as the normal transition" is None now - shown as
+	 * such in the properties. */
+	if (astrcmpi(obs_data_get_string(settings, "wrap_" SS_TYPE), TR_SAME) == 0)
+		obs_data_set_string(settings, "wrap_" SS_TYPE, TR_NONE);
+
 	/* ---- plain settings ---- */
 
 	pthread_mutex_lock(&pg->mutex);
@@ -1362,6 +1492,7 @@ static void pg_update(void *data, obs_data_t *settings)
 	pg->shuffle = shuffle;
 	pg->hide_when_done = obs_data_get_bool(settings, S_HIDE_DONE);
 	pg->restart_on_show = obs_data_get_bool(settings, S_RESTART_ON_SHOW);
+	pg->edges_only = obs_data_get_bool(settings, S_EDGES_ONLY);
 
 	si_layout_read(&pg->layout, settings);
 
@@ -1780,10 +1911,17 @@ static void pg_video_render(void *data, gs_effect_t *effect)
 {
 	struct picture_gallery *pg = data;
 	obs_source_t *transition = get_current_transition(pg);
+	obs_source_t *out = get_out_transition(pg);
 
 	if (transition) {
 		obs_source_video_render(transition);
 		obs_source_release(transition);
+	}
+
+	/* a picture going out with Hide is drawn over the one coming in */
+	if (out) {
+		obs_source_video_render(out);
+		obs_source_release(out);
 	}
 
 	UNUSED_PARAMETER(effect);
@@ -1797,6 +1935,9 @@ static void pg_video_tick(void *data, float seconds)
 
 	if (pg->trail_tr && --pg->trail_ticks <= 0)
 		end_trail(pg);
+
+	if (pg->out && os_atomic_load_bool(&pg->out->done))
+		drop_out(pg);
 
 	pg->size_timer += seconds;
 	if (pg->size_timer >= SIZE_UPDATE_INTERVAL) {
@@ -1921,14 +2062,22 @@ static bool pg_audio_render(void *data, uint64_t *ts_out, struct obs_source_audi
 			    size_t channels, size_t sample_rate)
 {
 	struct picture_gallery *pg = data;
-	obs_source_t *transition = get_current_transition(pg);
+	obs_source_t *transition = get_out_transition(pg);
 	struct obs_source_audio_mix child_audio;
-	uint64_t source_ts;
+	uint64_t source_ts = 0;
 	bool success = false;
 
 	UNUSED_PARAMETER(sample_rate);
 
-	/* the images are silent; this is a stinger's own sound */
+	/* The images are silent; this is a stinger's own sound. A Hide stinger
+	 * taking a picture out on top is heard over whatever brings the next
+	 * one in, which only has sound of its own while nothing is going out. */
+	if (transition && (obs_source_audio_pending(transition) || !obs_source_get_audio_timestamp(transition))) {
+		obs_source_release(transition);
+		transition = NULL;
+	}
+	if (!transition)
+		transition = get_current_transition(pg);
 	if (!transition)
 		return false;
 
@@ -1968,6 +2117,7 @@ static void pg_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, S_SHUFFLE, false);
 	obs_data_set_default_bool(settings, S_HIDE_DONE, false);
 	obs_data_set_default_bool(settings, S_RESTART_ON_SHOW, true);
+	obs_data_set_default_bool(settings, S_EDGES_ONLY, false);
 
 	for (size_t i = 0; i < PG_NUM_SLOTS; i++) {
 		enum pg_slot_id id = (enum pg_slot_id)i;
@@ -2000,16 +2150,16 @@ static bool slot_type_changed(void *priv, obs_properties_t *props, obs_property_
 	enum pg_slot_id id = (enum pg_slot_id)(desc - slot_desc);
 	char key[64];
 	const char *type = obs_data_get_string(settings, slot_key(key, sizeof(key), id, SS_TYPE));
-	bool same = desc->allow_same && (!*type || astrcmpi(type, TR_SAME) == 0);
+	bool none = is_none_type(id, type);
 	bool scene = astrcmpi(type, TR_SCENE) == 0;
-	bool is_cut = !same && astrcmpi(type, SI_TR_CUT) == 0;
-	bool is_stinger = !same && astrcmpi(type, SI_TR_STINGER) == 0;
+	bool is_cut = !none && astrcmpi(type, SI_TR_CUT) == 0;
+	bool is_stinger = !none && astrcmpi(type, SI_TR_STINGER) == 0;
 
 	UNUSED_PARAMETER(p);
 
 	set_visible(props, id, SS_SCENE, scene);
-	set_visible(props, id, SS_DURATION, !same && !is_cut && !is_stinger);
-	si_transition_options_visible(props, &slot_tr_keys[id], same ? "" : type);
+	set_visible(props, id, SS_DURATION, !none && !is_cut && !is_stinger);
+	si_transition_options_visible(props, &slot_tr_keys[id], none ? "" : type);
 
 	return true;
 }
@@ -2062,8 +2212,7 @@ static void add_slot_properties(obs_properties_t *props, enum pg_slot_id id, obs
 
 	p = obs_properties_add_list(group, slot_key(key, sizeof(key), id, SS_TYPE), T_TR_TYPE, OBS_COMBO_TYPE_LIST,
 				    OBS_COMBO_FORMAT_STRING);
-	if (desc->allow_same)
-		obs_property_list_add_string(p, T_TR_SAME, TR_SAME);
+	obs_property_list_add_string(p, T_TR_NONE, TR_NONE);
 	si_transition_list_add_builtins(p);
 	/* only inside the OBS UI, where there are scene transitions to use */
 	if (si_frontend_available())
@@ -2128,6 +2277,9 @@ static obs_properties_t *pg_properties(void *data)
 	obs_properties_add_bool(playback, S_SHUFFLE, T_SHUFFLE);
 	obs_properties_add_bool(playback, S_HIDE_DONE, T_HIDE_DONE);
 	obs_properties_add_bool(playback, S_RESTART_ON_SHOW, T_RESTART_ON_SHOW);
+
+	p = obs_properties_add_bool(playback, S_EDGES_ONLY, T_EDGES_ONLY);
+	obs_property_set_long_description(p, T_EDGES_ONLY_DESC);
 
 	obs_properties_add_group(props, S_GROUP_PLAYBACK, T_GROUP_PLAYBACK, OBS_GROUP_NORMAL, playback);
 

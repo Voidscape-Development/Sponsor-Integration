@@ -351,6 +351,22 @@ static size_t count_translucent(double from, double to)
 	return n;
 }
 
+/* samples drawn but not fully opaque - two images each fading on their own,
+ * rather than one crossfade between them, which stays opaque */
+static size_t count_see_through(double from, double to)
+{
+	size_t n = 0;
+
+	for (size_t i = 0; i < samples.num; i++) {
+		struct sample *s = &samples.array[i];
+
+		if (s->t >= from && s->t < to && s->c != C_NONE && s->a >= 10 && s->a < 245)
+			n++;
+	}
+
+	return n;
+}
+
 static enum color last_color(void)
 {
 	return samples.num ? samples.array[samples.num - 1].c : C_NONE;
@@ -583,7 +599,8 @@ static void update_string(obs_source_t *source, const char *key, const char *val
 /* scenarios                                                                  */
 
 /* No gap: the first image comes in from nothing, then each image is up for
- * the hold time plus the transition, never leaving an empty frame. */
+ * the hold time plus the transition, never leaving an empty frame - each one
+ * goes out with Hide over the next coming in with Show. */
 static void scenario_nogap(void)
 {
 	obs_source_t *src = start_gallery(gallery_settings());
@@ -603,6 +620,7 @@ static void scenario_nogap(void)
 	check(count_translucent(0.0, 0.35) > 0, "fades in from nothing (Show transition)");
 	check(count_color(0.7, 6.0, C_EMPTY) == 0, "never empty once running");
 	check(count_blends(1.2, 6.0) > 0, "images fade into each other");
+	check(count_see_through(1.2, 6.0) > 0, "each image fades out with Hide over the next fading in with Show");
 
 	obs_source_release(src);
 }
@@ -635,14 +653,98 @@ static void scenario_gap(void)
 	obs_source_release(src);
 }
 
+/* Show set to None: the next image is there at once, underneath the last one
+ * going out with Hide - never translucent, never empty. */
+static void scenario_show_none(void)
+{
+	obs_data_t *s = gallery_settings();
+	obs_source_t *src;
+
+	obs_data_set_string(s, "show_transition", "none");
+	src = start_gallery(s);
+
+	run(src, 5.0, NULL);
+
+	check(count_changes() >= 3, "at least 3 images in 5 s (%zu)", count_changes());
+	check(count_color(0.7, 5.0, C_EMPTY) == 0, "never empty once running");
+	check(count_translucent(0.7, 5.0) == 0, "the next image is fully there underneath (%zu translucent)",
+	      count_translucent(0.7, 5.0));
+	check(count_blends(1.0, 5.0) > 0, "the last image fades out over the next (Hide)");
+
+	obs_source_release(src);
+}
+
+/* Show and Hide both None: the Normal transition goes from image to image. */
+static void scenario_show_hide_none(void)
+{
+	obs_data_t *s = gallery_settings();
+	obs_source_t *src;
+
+	obs_data_set_string(s, "show_transition", "none");
+	obs_data_set_string(s, "hide_transition", "none");
+	obs_data_set_string(s, "normal_transition", "fade_to_color");
+	src = start_gallery(s);
+
+	run(src, 5.0, NULL);
+
+	check(count_changes() >= 3, "at least 3 images in 5 s (%zu)", count_changes());
+	check(count_color(1.2, 5.0, C_BLACK) > 0, "the Normal fade to color plays between images");
+	check(count_blends(1.2, 5.0) == 0, "no Show/Hide blend (%zu)", count_blends(1.2, 5.0));
+
+	obs_source_release(src);
+}
+
+/* Everything None: plain cuts. */
+static void scenario_all_none(void)
+{
+	obs_data_t *s = gallery_settings();
+	obs_source_t *src;
+
+	obs_data_set_string(s, "show_transition", "none");
+	obs_data_set_string(s, "hide_transition", "none");
+	obs_data_set_string(s, "normal_transition", "none");
+	src = start_gallery(s);
+
+	run(src, 4.0, NULL);
+
+	check(count_changes() >= 3, "at least 3 images in 4 s (%zu)", count_changes());
+	check(count_color(0.3, 4.0, C_EMPTY) == 0, "never empty");
+	check(count_color(0.3, 4.0, C_MIX) == 0, "cuts from image to image (%zu mixed)", count_color(0.3, 4.0, C_MIX));
+
+	obs_source_release(src);
+}
+
+/* Show/Hide only at the edges: images change with the Normal transition. */
+static void scenario_edges_only(void)
+{
+	obs_data_t *s = gallery_settings();
+	obs_source_t *src;
+
+	obs_data_set_bool(s, "show_hide_edges_only", true);
+	obs_data_set_string(s, "normal_transition", "fade_to_color");
+	src = start_gallery(s);
+
+	run(src, 5.0, NULL);
+
+	check(count_changes() >= 3, "at least 3 images in 5 s (%zu)", count_changes());
+	check(count_translucent(0.0, 0.35) > 0, "fades in from nothing (Show transition)");
+	check(count_color(1.2, 5.0, C_BLACK) > 0, "the Normal fade to color plays between images");
+	check(count_blends(1.2, 5.0) == 0, "no Show/Hide between images (%zu)", count_blends(1.2, 5.0));
+	check(count_see_through(1.2, 5.0) == 0, "no image fades out on its own between images");
+
+	obs_source_release(src);
+}
+
 /* A Loop wrap transition of its own: a cut at the loop point, fades
- * elsewhere. */
+ * elsewhere (with Show/Hide only at the edges, so the wrap replaces the Normal
+ * transition). */
 static void scenario_wrap(void)
 {
 	obs_data_t *s = gallery_settings();
 	obs_source_t *src;
 	struct event *wrap;
 
+	obs_data_set_bool(s, "show_hide_edges_only", true);
 	obs_data_set_string(s, "wrap_transition", "cut");
 	src = start_gallery(s);
 
@@ -819,8 +921,13 @@ static void retype_steps(obs_source_t *src, double t, int *step)
 
 static void scenario_retype(void)
 {
-	obs_source_t *src = start_gallery(gallery_settings());
+	obs_data_t *s = gallery_settings();
+	obs_source_t *src;
 	size_t before;
+
+	/* the Normal transition is the one on screen */
+	obs_data_set_bool(s, "show_hide_edges_only", true);
+	src = start_gallery(s);
 
 	run(src, 2.1, retype_steps);
 	before = count_changes();
@@ -850,16 +957,18 @@ static pthread_mutex_t hammer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static void *hammer(void *data)
 {
 	obs_source_t *src = data;
-	static const char *types[] = {"fade", "cut", "swipe", "slide", "fade_to_color", "same"};
+	static const char *types[] = {"fade", "cut", "swipe", "slide", "fade_to_color", "none", "same"};
 	unsigned seed = (unsigned)(uintptr_t)pthread_self();
 
 	while (os_atomic_load_bool(&hammering)) {
 		obs_data_t *s = obs_data_create();
 		int which = rand_r(&seed);
 
-		obs_data_set_string(s, "normal_transition", types[which % 5]);
-		obs_data_set_string(s, "wrap_transition", types[(which >> 4) % 6]);
-		obs_data_set_string(s, "hide_transition", types[(which >> 8) % 5]);
+		obs_data_set_string(s, "normal_transition", types[which % 6]);
+		obs_data_set_string(s, "wrap_transition", types[(which >> 4) % 7]);
+		obs_data_set_string(s, "hide_transition", types[(which >> 8) % 6]);
+		obs_data_set_string(s, "show_transition", types[(which >> 24) % 6]);
+		obs_data_set_bool(s, "show_hide_edges_only", (which >> 27) % 2);
 		obs_data_set_int(s, "normal_duration", 100 + (which >> 12) % 300);
 		obs_data_set_int(s, "gap_time", (which >> 16) % 2 ? 0 : 200);
 		obs_data_set_bool(s, "shuffle", (which >> 18) % 2);
@@ -914,6 +1023,9 @@ static void scenario_hammer(void)
 	s = gallery_settings();
 	obs_data_set_string(s, "normal_transition", "fade");
 	obs_data_set_string(s, "wrap_transition", "same");
+	obs_data_set_string(s, "show_transition", "fade");
+	obs_data_set_string(s, "hide_transition", "fade");
+	obs_data_set_bool(s, "show_hide_edges_only", false);
 	obs_data_set_int(s, "gap_time", 0);
 	obs_data_set_bool(s, "shuffle", false);
 	obs_source_update(src, s);
@@ -975,6 +1087,7 @@ static void scenario_scene(void)
 	obs_data_set_int(tint_settings, "color", 0xFFFFFFFF);
 	obs_data_set_int(tint_settings, "switch_point", 50);
 
+	obs_data_set_bool(s, "show_hide_edges_only", true);
 	obs_data_set_string(s, "normal_transition", "scene");
 	obs_data_set_string(s, "normal_scene_transition", "Tint");
 	obs_data_set_int(s, "normal_duration", 600);
@@ -1015,6 +1128,7 @@ static void scenario_stinger(void)
 		return;
 	}
 
+	obs_data_set_bool(s, "show_hide_edges_only", true);
 	obs_data_set_string(s, "normal_transition", "stinger");
 	obs_data_set_string(s, "normal_stinger_path", stinger_path);
 	obs_data_set_int(s, "normal_stinger_transition_point", 500);
@@ -1129,6 +1243,10 @@ struct scenario {
 static const struct scenario scenarios[] = {
 	{"nogap", scenario_nogap},
 	{"gap", scenario_gap},
+	{"show_none", scenario_show_none},
+	{"show_hide_none", scenario_show_hide_none},
+	{"all_none", scenario_all_none},
+	{"edges_only", scenario_edges_only},
 	{"wrap", scenario_wrap},
 	{"end", scenario_end},
 	{"controls", scenario_controls},

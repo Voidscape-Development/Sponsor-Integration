@@ -105,8 +105,9 @@ The source exposes procedures and signals for scripts and `obs-websocket`:
 
 ## Picture Gallery
 
-An image rotation in the spirit of Image Slide Show, with a **separate transition for every direction
-the gallery moves in** (like the Source Switcher plugin) and an optional **gap** between images.
+An image rotation in the spirit of Image Slide Show, where **every image comes in with a Show
+transition and goes out with a Hide transition**, with a Normal and a Loop wrap transition alongside
+and an optional **gap** between images.
 
 ### Images
 
@@ -120,11 +121,12 @@ as they are on screen.
 | Setting | Description |
 |---|---|
 | **Hold time** | How long each image is fully on screen. Transitions come on top of this. |
-| **Gap between images** | `0` *(default)* moves straight from one image to the next with the Normal transition. Above `0`, each image goes out with the Hide transition, the gallery stays empty (transparent) for the gap, and the next image comes in with the Show transition. |
+| **Gap between images** | `0` *(default)*: the next image comes in with the Show transition while the last one goes out with the Hide transition, both at once. Above `0`, each image goes out with Hide, the gallery stays empty (transparent) for the gap, and the next image comes in with Show. |
 | **Loop gallery** | Start over after the last image. |
 | **Shuffle order** | Shuffles the running order so every image comes up exactly once per pass, without repeating across the loop point. |
 | **Hide when the gallery ends** | With looping off, go out with the Hide transition at the end instead of holding the last image. |
 | **Restart gallery when the source becomes visible** | Start from the first image whenever the source is shown. With this off, it picks up at the image it was on. |
+| **Use Show/Hide only when the gallery comes in or goes out** | Off by default. On, images change with the Normal transition and Show/Hide only play when the gallery comes in from or goes out to nothing (starting, the Show/Hide controls, Stop, the end, and around a gap) — the way the Source Switcher plugin uses them. |
 
 The gallery only advances while the source is visible.
 
@@ -134,10 +136,24 @@ Each of the four directions has its own transition, duration and options:
 
 | Direction | Plays when |
 |---|---|
-| **Normal** (image → image) | One image follows the next with no gap, and on Next/Previous. |
-| **Show** (nothing → image) | The source becomes visible, the gallery is started, restarted or shown again with the Show control, and after a gap. |
-| **Hide** (image → nothing) | Going into a gap, Stop, the Hide control, and the end of a gallery set to hide when it ends. |
-| **Loop wrap** (last → first) | A looping gallery goes from its last image back to its first. *Same as the normal transition* by default. With a gap set, it brings the first image in after the gap in place of Show. |
+| **Show** (→ image) | Every image coming in: as it replaces the last one, when the source becomes visible, when the gallery is started, restarted or shown again with the Show control, and after a gap. |
+| **Hide** (image →) | Every image going out: as the next one replaces it (drawn on top of the incoming image), going into a gap, Stop, the Hide control, and the end of a gallery set to hide when it ends. |
+| **Normal** (image → image) | One image straight to the next when Show and Hide are both *None* — or always, with *Use Show/Hide only when the gallery comes in or goes out* on. |
+| **Loop wrap** (→ first image) | A looping gallery goes from its last image back to its first: it brings the first image in in place of Show (or Normal, with Show/Hide only at the edges). *None* by default. |
+
+Any direction can be set to **None** to leave it unused, and the gallery works out what to play
+instead:
+
+| Show | Hide | Image → image (no gap) |
+|---|---|---|
+| set | set | The old image goes out with Hide on top while the new one comes in with Show. |
+| set | None | Show plays straight from the old image to the new one. |
+| None | set | The new image is there underneath while the old one goes out with Hide. |
+| None | None | The Normal transition plays from one image to the other. |
+
+When the gallery comes in from or goes out to nothing (starting, a gap, Stop, the Show/Hide
+controls) a Show or Hide set to *None* uses the Normal transition. Normal set to *None* is a cut.
+Loop wrap set to *None* means the loop point is treated like any other change.
 
 Every direction can use **Cut**, **Fade**, **Swipe**, **Slide**, **Fade to Color** or **Stinger**, or
 **OBS scene transition** to use one of the transitions set up in the Scene Transitions dock (Move and
@@ -163,8 +179,9 @@ Playlist.
 ### Controls
 
 The gallery appears in the **Media Controls** dock: play/pause (freezes the hold timer), restart,
-stop (goes out with Hide), next and previous (with the Normal transition, or Show when the gallery is
-empty; a manual skip never waits out the gap). Hotkeys are available for all of those plus **Show**
+stop (goes out with Hide), next and previous (the old image goes out with Hide as the next comes in
+with Show, as on any other change — or with the Normal transition with Show/Hide only at the edges;
+a manual skip never waits out the gap). Hotkeys are available for all of those plus **Show**
 and **Hide**, which take the gallery out with its Hide transition and bring it back with its Show
 transition, keeping its place.
 
