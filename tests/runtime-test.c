@@ -624,11 +624,77 @@ static void update_string(obs_source_t *source, const char *key, const char *val
 /* No gap: the first image comes in from nothing, then each image is up for
  * the hold time plus the transition, never leaving an empty frame - each one
  * goes out with Hide over the next coming in with Show. */
+/* The gallery's own transitions, followed through the first fade so a run
+ * where it is not seen shows what they were doing. */
+#define MAX_WATCHED 8
+static obs_source_t *watched[MAX_WATCHED];
+static size_t num_watched;
+
+static void on_tr_start(void *data, calldata_t *cd)
+{
+	char what[64];
+
+	(void)cd;
+	snprintf(what, sizeof(what), "tr%zu transition_start", (size_t)(uintptr_t)data);
+	mark(what);
+}
+
+static void on_tr_stop(void *data, calldata_t *cd)
+{
+	char what[64];
+
+	(void)cd;
+	snprintf(what, sizeof(what), "tr%zu transition_stop", (size_t)(uintptr_t)data);
+	mark(what);
+}
+
+static void watch_child(obs_source_t *parent, obs_source_t *child, void *param)
+{
+	signal_handler_t *sh;
+
+	(void)parent;
+	(void)param;
+
+	if (obs_source_get_type(child) != OBS_SOURCE_TYPE_TRANSITION || num_watched >= MAX_WATCHED)
+		return;
+	for (size_t i = 0; i < num_watched; i++) {
+		if (watched[i] == child)
+			return;
+	}
+
+	sh = obs_source_get_signal_handler(child);
+	signal_handler_connect(sh, "transition_start", on_tr_start, (void *)(uintptr_t)num_watched);
+	signal_handler_connect(sh, "transition_stop", on_tr_stop, (void *)(uintptr_t)num_watched);
+	watched[num_watched++] = child;
+}
+
+static void watch_first_fade(obs_source_t *src, double t, int *step)
+{
+	(void)step;
+
+	if (t > 0.7)
+		return;
+
+	obs_source_enum_active_sources(src, watch_child, NULL);
+
+	for (size_t i = 0; i < num_watched; i++) {
+		obs_source_t *dest = obs_transition_get_source(watched[i], OBS_TRANSITION_SOURCE_B);
+		obs_source_t *shown = obs_transition_get_active_source(watched[i]);
+		char what[64];
+
+		snprintf(what, sizeof(what), "tr%zu time %.2f to %s, showing %s", i,
+			 obs_transition_get_time(watched[i]), dest ? "picture" : "-", shown ? "picture" : "-");
+		mark(what);
+		obs_source_release(dest);
+		obs_source_release(shown);
+	}
+}
+
 static void scenario_nogap(void)
 {
 	obs_source_t *src = start_gallery(gallery_settings());
 
-	run(src, 6.0, NULL);
+	run(src, 6.0, watch_first_fade);
 
 	check(count_changes() >= 4, "at least 4 images in 6 s (%zu)", count_changes());
 	for (size_t i = 0; i < 4 && change(i); i++)
