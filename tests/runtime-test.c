@@ -529,6 +529,61 @@ static bool start_obs(const char *plugin, const char *plugin_data)
 	return true;
 }
 
+/*
+ * Draws each built-in transition a few times, offscreen, before any scenario
+ * runs. A software renderer compiles a shader the first time it draws with it,
+ * and on CI's runners that holds the first frame of a fade for most of a
+ * second - longer than the fade - so a scenario's first fade could never be
+ * seen.
+ */
+static void warm_up_transitions(void)
+{
+	static const char *ids[] = {"fade_transition", "fade_to_color_transition", "swipe_transition",
+				    "slide_transition"};
+	obs_data_t *image_settings = obs_data_create();
+	struct dstr path = {0};
+	obs_source_t *image;
+
+	dstr_printf(&path, "%s/1_red.png", image_dir);
+	obs_data_set_string(image_settings, "file", path.array);
+	image = obs_source_create_private("image_source", NULL, image_settings);
+	obs_data_release(image_settings);
+	dstr_free(&path);
+
+	/* drawn with a picture, so the image's own drawing is compiled too */
+	for (int i = 0; i < 100 && image && !obs_source_get_width(image); i++)
+		os_sleep_ms(10);
+
+	for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+		obs_source_t *tr = obs_source_create_private(ids[i], NULL, NULL);
+
+		if (!tr)
+			continue;
+
+		obs_transition_set_size(tr, 64, 36);
+		obs_transition_start(tr, OBS_TRANSITION_MODE_AUTO, 200, image);
+
+		for (int frame = 0; frame < 3; frame++) {
+			obs_enter_graphics();
+			if (!texrender)
+				texrender = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+			gs_texrender_reset(texrender);
+			if (gs_texrender_begin(texrender, 64, 36)) {
+				gs_ortho(0.0f, 64.0f, 0.0f, 36.0f, -100.0f, 100.0f);
+				obs_source_video_render(tr);
+				gs_texrender_end(texrender);
+			}
+			obs_leave_graphics();
+			os_sleep_ms(20);
+		}
+
+		obs_transition_clear(tr);
+		obs_source_release(tr);
+	}
+
+	obs_source_release(image);
+}
+
 static obs_data_t *gallery_settings(void)
 {
 	obs_data_t *s = obs_data_create();
@@ -1359,6 +1414,8 @@ int main(int argc, char **argv)
 		fprintf(stderr, "could not start libobs\n");
 		return 2;
 	}
+
+	warm_up_transitions();
 
 	printf("== %s\n", scenario->name);
 	t0 = os_gettime_ns();
