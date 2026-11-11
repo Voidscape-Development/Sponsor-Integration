@@ -2008,9 +2008,27 @@ static bool ended_since_tick(struct picture_gallery *pg, obs_source_t *tr)
 	return ended;
 }
 
+/* Whether `tr` is going to a picture and gets there this frame. One going to
+ * nothing ends on nothing, which libobs draws correctly. */
+static bool ends_on_picture_now(obs_source_t *tr)
+{
+	obs_source_t *dest;
+	bool ending;
+
+	if (obs_transition_get_time(tr) < 1.0f)
+		return false;
+
+	/* libobs only holds a second picture while it transitions to it */
+	dest = obs_transition_get_source(tr, OBS_TRANSITION_SOURCE_B);
+	ending = dest != NULL;
+	obs_source_release(dest);
+
+	return ending;
+}
+
 static void render_transition(struct picture_gallery *pg, obs_source_t *tr)
 {
-	bool ending = obs_transition_is_active(tr) && obs_transition_get_time(tr) >= 1.0f;
+	bool ending = ends_on_picture_now(tr);
 	obs_source_t *picture;
 	struct matrix4 mat;
 
