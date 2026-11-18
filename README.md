@@ -208,10 +208,10 @@ This project uses the OBS plugin template build system.
 
 | Platform | Tool |
 |-----------|--------|
-| Windows | Visual Studio 17 2022 |
-| macOS | Xcode 16.0 |
+| Windows | Visual Studio 18 2026 |
+| macOS | Xcode 26.5 |
 | Windows, macOS | CMake 3.30.5 |
-| Ubuntu 24.04 | CMake 3.28.3, `ninja-build`, `pkg-config`, `build-essential` |
+| Ubuntu 26.04 | CMake 3.28.3, `ninja-build`, `pkg-config`, `build-essential` |
 
 ```sh
 cmake --preset ubuntu-x86_64   # or macos / windows-x64

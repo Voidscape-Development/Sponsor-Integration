@@ -1,0 +1,18 @@
+{
+    "display_name": "Sponsor Integration",
+    "id": "c5072c7d-4b1c-45ca-8175-6c6a98ba1b64",
+    "version": "1.0.0",
+    "authors": [
+        "Voidscape Development"
+    ],
+    "name": "sponsor-integration",
+    "description": "An OBS Studio plugin with tooling for running sponsor and advertising content on stream.",
+    "long_description": "An OBS Studio plugin with tooling for running sponsor and advertising content on stream.",
+    "urls": {
+        "repository": "https://github.com/Voidscape-Development/Sponsor-Integration",
+        "website": "https://github.com/Voidscape-Development/Sponsor-Integration",
+        "support": "https://github.com/Voidscape-Development/Sponsor-Integration/issues"
+    },
+    "has_banner": false,
+    "has_icon": false
+}
